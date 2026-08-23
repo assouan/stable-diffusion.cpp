@@ -1790,20 +1790,27 @@ protected:
     size_t max_graph_vram_bytes           = 0;
     bool stream_layers_enabled            = false;
     bool stream_residency_enabled         = false;
+    bool stream_layer_pool_enabled        = false;
     int resident_segment_limit            = -1;
     int segment_prefetch_depth            = 0;
     size_t runtime_resident_segment_cap   = SIZE_MAX;
+    size_t runtime_prefetch_depth_cap     = SIZE_MAX;
+    size_t runtime_pool_slot_cap          = SIZE_MAX;
     bool stream_next_forward_prefetch     = false;
     bool stream_policy_logged             = false;
     bool stream_prefetch_runtime_warned   = false;
     bool stream_prefetch_reduced_warned   = false;
     bool stream_shared_params_logged      = false;
     bool stream_limits_unavailable_warned = false;
+    bool stream_pool_budget_warned        = false;
     size_t observed_max_effective_budget_ = 0;
     bool graph_cut_layer_split_enabled    = false;
     std::vector<size_t> graph_cut_layer_split_backend_vram_limits_;
     std::vector<std::vector<ggml_tensor*>> stream_prefetch_plan_signature_;
     size_t stream_prefetch_plan_depth_ = 0;
+    // A configured pool is retained across forwards and released at a sampling boundary.
+    size_t stream_pool_slots_      = 0;
+    size_t stream_pool_slot_bytes_ = 0;
 
     std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
     ggml_backend_sched_t sched             = nullptr;    // owned
@@ -2462,6 +2469,35 @@ protected:
                !is_multi_device();
     }
 
+    sd::ggml_graph_cut::StreamingPolicy annotate_streaming_policy(
+        GraphCutPlan& plan,
+        size_t effective_budget) {
+        int effective_resident_limit = stream_residency_enabled
+                                           ? resident_segment_limit
+                                           : 0;
+        if (runtime_resident_segment_cap != SIZE_MAX &&
+            (effective_resident_limit < 0 ||
+             static_cast<size_t>(effective_resident_limit) > runtime_resident_segment_cap)) {
+            effective_resident_limit = static_cast<int>(std::min(
+                runtime_resident_segment_cap,
+                static_cast<size_t>(std::numeric_limits<int>::max())));
+        }
+
+        int effective_prefetch_depth = segment_prefetch_depth;
+        if (runtime_prefetch_depth_cap != SIZE_MAX &&
+            static_cast<size_t>(effective_prefetch_depth) > runtime_prefetch_depth_cap) {
+            effective_prefetch_depth = static_cast<int>(std::min(
+                runtime_prefetch_depth_cap,
+                static_cast<size_t>(std::numeric_limits<int>::max())));
+        }
+        return sd::ggml_graph_cut::annotate_residency(plan,
+                                                      effective_budget,
+                                                      effective_resident_limit,
+                                                      effective_prefetch_depth,
+                                                      stream_layer_pool_enabled,
+                                                      runtime_pool_slot_cap);
+    }
+
     bool resolve_graph_cut_plan(ggml_cgraph* gf,
                                 GraphCutPlan* plan_out,
                                 size_t* effective_budget_out                              = nullptr,
@@ -2486,13 +2522,12 @@ protected:
                 // Resident and queued buffers reduce reported free VRAM, but
                 // this runner can reuse or release them. Other allocations
                 // remain charged through free_vram.
-                constexpr size_t safety_margin = 512ull * 1024 * 1024;
-                size_t reclaimable_free        = saturating_size_add(free_vram, runner_owned_vram);
+                size_t reclaimable_free = saturating_size_add(free_vram, runner_owned_vram);
                 if (total_vram > 0) {
                     reclaimable_free = std::min(reclaimable_free, total_vram);
                 }
-                free_clamp = reclaimable_free > safety_margin
-                                 ? reclaimable_free - safety_margin
+                free_clamp = reclaimable_free > sd::ggml_graph_cut::STREAMING_VRAM_SAFETY_MARGIN
+                                 ? reclaimable_free - sd::ggml_graph_cut::STREAMING_VRAM_SAFETY_MARGIN
                                  : 0;
                 if (free_clamp < effective_budget) {
                     LOG_DEBUG(
@@ -2554,20 +2589,7 @@ protected:
                                                      get_desc().c_str());
         sd::ggml_graph_cut::StreamingPolicy streaming_policy;
         if (stream_layers_enabled) {
-            int effective_resident_limit = stream_residency_enabled
-                                               ? resident_segment_limit
-                                               : 0;
-            if (runtime_resident_segment_cap != SIZE_MAX &&
-                (effective_resident_limit < 0 ||
-                 static_cast<size_t>(effective_resident_limit) > runtime_resident_segment_cap)) {
-                effective_resident_limit = static_cast<int>(std::min(
-                    runtime_resident_segment_cap,
-                    static_cast<size_t>(std::numeric_limits<int>::max())));
-            }
-            streaming_policy = sd::ggml_graph_cut::annotate_residency(*plan_out,
-                                                                      effective_budget,
-                                                                      effective_resident_limit,
-                                                                      segment_prefetch_depth);
+            streaming_policy = annotate_streaming_policy(*plan_out, effective_budget);
         }
         if (streaming_policy_out != nullptr) {
             *streaming_policy_out = streaming_policy;
@@ -2713,6 +2735,38 @@ protected:
         }
         stream_prefetch_plan_signature_.clear();
         stream_prefetch_plan_depth_ = 0;
+    }
+
+    bool clear_stream_pool_state() {
+        bool released = true;
+        if (auto manager = weight_manager.lock()) {
+            released = manager->release_streaming_pool(stream_prefetch_owner_id());
+        }
+        if (released) {
+            stream_pool_slots_      = 0;
+            stream_pool_slot_bytes_ = 0;
+        }
+        return released;
+    }
+
+    void reduce_runtime_prefetch_depth(size_t depth) {
+        runtime_prefetch_depth_cap = std::min(runtime_prefetch_depth_cap, depth);
+        stream_policy_logged       = false;
+    }
+
+    void disable_runtime_prefetch() {
+        clear_stream_prefetch_state();
+        reduce_runtime_prefetch_depth(0);
+    }
+
+    void release_kept_stream_params() {
+        std::vector<ggml_tensor*> params;
+        params.reserve(kept_compute_param_tensor_set.size());
+        for (const ggml_tensor* tensor : kept_compute_param_tensor_set) {
+            params.push_back(const_cast<ggml_tensor*>(tensor));
+        }
+        free_compute_backend_param_tensors(params);
+        kept_compute_param_tensor_set.clear();
     }
 
     void update_stream_prefetch_plan_signature(
@@ -2897,7 +2951,7 @@ protected:
             if (released_bytes > 0) {
                 LOG_WARN(
                     "%s evicted resident segment %zu to make room for prefetch; "
-                    "resident cap reduced to %zu, released %.2f MB",
+                    "resident cap reduced to %zu, reclaimed %.2f MB of streaming capacity",
                     get_desc().c_str(),
                     candidate_index + 1,
                     runtime_resident_segment_cap,
@@ -2927,7 +2981,8 @@ protected:
         }
         return manager->enqueue_param_prefetch(stream_prefetch_owner_id(),
                                                segment_prefetch_id(segment_index),
-                                               stream_params.prefetch_by_segment[segment_index]);
+                                               stream_params.prefetch_by_segment[segment_index],
+                                               stream_layer_pool_enabled);
     }
 
     ParamPrefetchResult enqueue_segment_prefetch_with_eviction(
@@ -3295,19 +3350,112 @@ protected:
                                                             GraphCutPlan& plan,
                                                             int n_threads,
                                                             bool log_residency,
-                                                            bool no_return                                             = false,
-                                                            const sd::ggml_graph_cut::StreamingPolicy* prefetch_policy = nullptr) {
+                                                            bool no_return,
+                                                            size_t effective_budget,
+                                                            sd::ggml_graph_cut::StreamingPolicy streaming_policy) {
         GGML_ASSERT(gf != nullptr);
 
         free_compute_buffer();
         free_cache_ctx_and_buffer();
 
-        auto manager                  = weight_manager.lock();
-        const bool prefetch_requested = prefetch_policy != nullptr &&
-                                        prefetch_policy->prefetch_depth > 0;
+        auto manager     = weight_manager.lock();
+        bool pool_active = false;
+        if (stream_layer_pool_enabled) {
+            if (streaming_policy.pool_slots == 0 ||
+                streaming_policy.pool_slot_bytes == 0) {
+                LOG_ERROR(
+                    "%s cannot use the streaming layer pool because the graph has no poolable segment-private parameters",
+                    get_desc().c_str());
+                free_compute_ctx();
+                return std::nullopt;
+            }
+            if (manager == nullptr) {
+                LOG_ERROR("%s streaming layer pool requires a weight manager",
+                          get_desc().c_str());
+                free_compute_ctx();
+                return std::nullopt;
+            }
+
+            if (stream_pool_slots_ > 0 &&
+                stream_pool_slot_bytes_ < streaming_policy.pool_slot_bytes) {
+                clear_stream_prefetch_state();
+                release_kept_stream_params();
+                if (!clear_stream_pool_state()) {
+                    LOG_ERROR("%s cannot grow the streaming layer pool while a slot is active",
+                              get_desc().c_str());
+                    free_compute_ctx();
+                    return std::nullopt;
+                }
+                runtime_pool_slot_cap = SIZE_MAX;
+                streaming_policy      = annotate_streaming_policy(plan, effective_budget);
+            } else if (stream_pool_slots_ == 0) {
+                clear_stream_prefetch_state();
+                release_kept_stream_params();
+            }
+
+            StreamingPoolAllocation pool = manager->configure_streaming_pool(
+                stream_prefetch_owner_id(),
+                runtime_backend,
+                streaming_policy.pool_slots,
+                streaming_policy.pool_slot_bytes);
+            if (!pool) {
+                LOG_ERROR(
+                    "%s failed to create the mandatory streaming layer pool; inference cannot continue",
+                    get_desc().c_str());
+                free_compute_ctx();
+                return std::nullopt;
+            }
+            stream_pool_slots_      = pool.slot_count;
+            stream_pool_slot_bytes_ = pool.slot_bytes;
+            runtime_pool_slot_cap   = std::min(runtime_pool_slot_cap, pool.slot_count);
+            if (streaming_policy.pool_slots > pool.slot_count) {
+                streaming_policy = annotate_streaming_policy(plan, effective_budget);
+                if (streaming_policy.pool_slots > pool.slot_count ||
+                    streaming_policy.pool_slot_bytes > pool.slot_bytes) {
+                    LOG_ERROR("%s cannot fit the selected streaming policy in the allocated pool",
+                              get_desc().c_str());
+                    free_compute_ctx();
+                    return std::nullopt;
+                }
+            }
+            pool_active = true;
+
+            if (streaming_policy.pool_minimum_exceeds_budget &&
+                !stream_pool_budget_warned) {
+                LOG_WARN(
+                    "%s effective streaming budget %.2f MB is below the required one-slot pool footprint; allocating the mandatory %.2f MB slot needed to execute the model",
+                    get_desc().c_str(),
+                    effective_budget / (1024.0 * 1024.0),
+                    streaming_policy.pool_slot_bytes / (1024.0 * 1024.0));
+                stream_pool_budget_warned = true;
+            }
+        }
+
+        const bool prefetch_requested = streaming_policy.prefetch_depth > 0;
         SegmentStreamParams stream_params;
         if (stream_layers_enabled) {
-            stream_params = collect_stream_segment_params(plan, prefetch_requested);
+            stream_params = collect_stream_segment_params(plan,
+                                                          prefetch_requested || pool_active);
+        }
+        if (stream_layers_enabled && !stream_policy_logged) {
+            const size_t parameter_segments = static_cast<size_t>(std::count_if(
+                plan.segments.begin(), plan.segments.end(), [](const GraphCutSegment& segment) {
+                    return segment.input_param_bytes > 0;
+                }));
+            LOG_INFO(
+                "%s layer stream: %zu parameter segments, resident requested=%d selected=%zu, "
+                "prefetch requested=%d selected=%zu, pool=%s required-slots=%zu allocated-slots=%zu slot=%.2f MB",
+                get_desc().c_str(),
+                parameter_segments,
+                resident_segment_limit,
+                streaming_policy.resident_segments,
+                segment_prefetch_depth,
+                streaming_policy.prefetch_depth,
+                pool_active ? "active" : "disabled",
+                streaming_policy.pool_slots,
+                pool_active ? stream_pool_slots_ : 0,
+                streaming_policy.pool_slot_bytes / (1024.0 * 1024.0));
+            stream_policy_logged = true;
         }
         if (stream_layers_enabled && !kept_compute_param_tensor_set.empty()) {
             std::unordered_set<const ggml_tensor*> desired_resident_params;
@@ -3343,11 +3491,12 @@ protected:
                 }
             }
         }
-        bool prefetch_active          = prefetch_requested && stream_params.has_prefetch_params;
-        size_t runtime_prefetch_depth = prefetch_active
-                                            ? prefetch_policy->prefetch_depth
+        bool async_prefetch_active    = prefetch_requested &&
+                                        stream_params.has_prefetch_params;
+        size_t runtime_prefetch_depth = async_prefetch_active
+                                            ? streaming_policy.prefetch_depth
                                             : 0;
-        if (prefetch_active) {
+        if (async_prefetch_active) {
             update_stream_prefetch_plan_signature(stream_params.prefetch_by_segment,
                                                   runtime_prefetch_depth);
         } else {
@@ -3367,31 +3516,36 @@ protected:
             }
         } prefetch_cleanup{manager, stream_prefetch_owner_id()};
 
-        auto disable_prefetch = [&](const char* reason) {
+        auto disable_async_prefetch = [&](const char* reason) {
             if (!stream_prefetch_runtime_warned) {
-                LOG_WARN("%s segment prefetch failed while %s; continuing with synchronous streaming",
-                         get_desc().c_str(),
-                         reason);
+                if (pool_active) {
+                    LOG_WARN(
+                        "%s asynchronous segment prefetch failed while %s; continuing with synchronous transfers through the streaming pool",
+                        get_desc().c_str(),
+                        reason);
+                } else {
+                    LOG_WARN(
+                        "%s asynchronous segment prefetch failed while %s; continuing with synchronous per-segment streaming",
+                        get_desc().c_str(),
+                        reason);
+                }
                 stream_prefetch_runtime_warned = true;
             }
-            clear_stream_prefetch_state();
-            prefetch_active = false;
+            disable_runtime_prefetch();
+            runtime_prefetch_depth = 0;
+            async_prefetch_active  = false;
         };
-
-        if (prefetch_active) {
-            ParamPrefetchResult result = enqueue_segment_prefetch_with_eviction(
-                stream_params.param_segments.front(),
-                stream_params.param_segments.front(),
-                stream_params,
-                plan,
-                residency_changed);
-            if (result != ParamPrefetchResult::SUCCESS) {
-                disable_prefetch("queueing the first segment");
-            }
-        }
 
         std::unordered_map<ggml_tensor*, PersistentExternalBinding> persistent_externals;
         snapshot_persistent_externals(plan, gf, persistent_externals);
+
+        auto abort_segmented_compute = [this]() -> std::optional<sd::Tensor<T>> {
+            backend_tensor_data_map.clear();
+            free_cache_ctx_and_buffer();
+            free_compute_buffer();
+            free_compute_ctx();
+            return std::nullopt;
+        };
 
         std::optional<sd::Tensor<T>> output = sd::Tensor<T>();
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); ++seg_idx) {
@@ -3404,38 +3558,46 @@ protected:
             const bool is_param_segment = param_position != SIZE_MAX;
             auto future_cut_names       = sd::ggml_graph_cut::collect_future_input_names(gf, plan, seg_idx);
 
-            if (is_param_segment && prefetch_active) {
-                ParamPrefetchResult result = enqueue_segment_prefetch_with_eviction(
-                    seg_idx,
-                    seg_idx,
-                    stream_params,
-                    plan,
-                    residency_changed);
-                if (result != ParamPrefetchResult::SUCCESS ||
-                    !activate_segment_prefetch(seg_idx, stream_params)) {
-                    disable_prefetch("activating a segment");
+            if (is_param_segment && (pool_active || async_prefetch_active)) {
+                auto activate_current_segment = [&]() {
+                    ParamPrefetchResult result = enqueue_segment_prefetch_with_eviction(
+                        seg_idx,
+                        seg_idx,
+                        stream_params,
+                        plan,
+                        residency_changed);
+                    return result == ParamPrefetchResult::SUCCESS &&
+                           activate_segment_prefetch(seg_idx, stream_params);
+                };
+                if (!activate_current_segment()) {
+                    if (!pool_active) {
+                        disable_async_prefetch("activating a segment");
+                    } else {
+                        if (async_prefetch_active) {
+                            disable_async_prefetch("activating the current segment");
+                        } else {
+                            clear_stream_prefetch_state();
+                        }
+                        if (!activate_current_segment()) {
+                            LOG_ERROR(
+                                "%s failed to stage the current segment in the mandatory streaming pool",
+                                get_desc().c_str());
+                            return abort_segmented_compute();
+                        }
+                    }
                 }
             }
 
             if (log_residency) {
-                if (prefetch_policy != nullptr) {
-                    LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s (residency=%s, prefetch=%zu)",
-                              get_desc().c_str(),
-                              seg_idx + 1,
-                              plan.segments.size(),
-                              segment.group_name.c_str(),
-                              segment.residency == sd::ggml_graph_cut::SegmentResidency::RESIDENT
-                                  ? "RESIDENT"
-                                  : "STREAMED",
-                              prefetch_active ? runtime_prefetch_depth : 0);
-                } else {
-                    LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s (residency=%s)",
-                              get_desc().c_str(),
-                              seg_idx + 1,
-                              plan.segments.size(),
-                              segment.group_name.c_str(),
-                              segment.residency == sd::ggml_graph_cut::SegmentResidency::RESIDENT ? "RESIDENT" : "STREAMED");
-                }
+                LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s (residency=%s, prefetch=%zu)",
+                          get_desc().c_str(),
+                          seg_idx + 1,
+                          plan.segments.size(),
+                          segment.group_name.c_str(),
+                          segment.residency == sd::ggml_graph_cut::SegmentResidency::RESIDENT
+                              ? "RESIDENT"
+                              : "STREAMED",
+                          async_prefetch_active ? runtime_prefetch_depth : 0);
             } else {
                 LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s",
                           get_desc().c_str(),
@@ -3467,16 +3629,16 @@ protected:
             ggml_cgraph* segment_graph      = sd::ggml_graph_cut::build_segment_graph(gf, segment, &segment_graph_ctx);
             const bool keep_segment_params  = segment.residency == sd::ggml_graph_cut::SegmentResidency::RESIDENT;
             std::function<void()> before_compute;
-            if (is_param_segment && prefetch_active) {
+            if (is_param_segment && async_prefetch_active && runtime_prefetch_depth > 0) {
                 before_compute = [this,
                                   param_position,
                                   &stream_params,
                                   &plan,
                                   &runtime_prefetch_depth,
-                                  &prefetch_active,
+                                  &async_prefetch_active,
                                   &residency_changed,
-                                  &disable_prefetch]() {
-                    if (!prefetch_active) {
+                                  &disable_async_prefetch]() {
+                    if (!async_prefetch_active) {
                         return;
                     }
                     SegmentPrefetchQueueResult result = queue_future_segment_prefetches(
@@ -3492,6 +3654,7 @@ protected:
                     if (result.result == ParamPrefetchResult::ALLOCATION_FAILURE &&
                         result.queued_depth > 0) {
                         runtime_prefetch_depth = result.queued_depth;
+                        reduce_runtime_prefetch_depth(runtime_prefetch_depth);
                         if (!stream_prefetch_reduced_warned) {
                             LOG_WARN("%s reduced segment prefetch depth to %zu after exhausting resident evictions",
                                      get_desc().c_str(),
@@ -3500,7 +3663,7 @@ protected:
                         }
                         return;
                     }
-                    disable_prefetch("queueing future segments");
+                    disable_async_prefetch("queueing future segments");
                 };
             }
             auto segment_output = execute_graph<T>(segment_graph,
@@ -3528,7 +3691,7 @@ protected:
         backend_tensor_data_map.clear();
         free_cache_ctx_and_buffer();
         free_compute_ctx();
-        prefetch_cleanup.keep = prefetch_active;
+        prefetch_cleanup.keep = async_prefetch_active;
         return output;
     }
 
@@ -3536,9 +3699,13 @@ public:
     void runner_done() {
         stream_residency_enabled       = false;
         runtime_resident_segment_cap   = SIZE_MAX;
+        runtime_prefetch_depth_cap     = SIZE_MAX;
+        runtime_pool_slot_cap          = SIZE_MAX;
         stream_next_forward_prefetch   = false;
         stream_policy_logged           = false;
+        stream_prefetch_runtime_warned = false;
         stream_prefetch_reduced_warned = false;
+        stream_pool_budget_warned      = false;
         free_compute_buffer();
         clear_stream_prefetch_state();
         std::vector<ggml_tensor*> tensors_to_release = std::move(this->runner_param_tensors);
@@ -3547,6 +3714,7 @@ public:
         kept_compute_param_tensor_set.clear();
         free_compute_backend_param_tensors(tensors_to_release);
         free_params_backend_param_tensors(tensors_to_release);
+        clear_stream_pool_state();
     }
 
 public:
@@ -3562,6 +3730,8 @@ public:
 
     virtual ~GGMLRunner() {
         clear_stream_prefetch_state();
+        release_kept_stream_params();
+        clear_stream_pool_state();
         free_compute_buffer();
         free_params_ctx();
         free_compute_ctx();
@@ -3719,56 +3889,50 @@ public:
 
         if (can_attempt_graph_cut_segmented_compute()) {
             GraphCutPlan plan;
+            size_t effective_budget = 0;
             sd::ggml_graph_cut::StreamingPolicy streaming_policy;
-            if (!resolve_graph_cut_plan(gf, &plan, nullptr, &streaming_policy)) {
+            if (!resolve_graph_cut_plan(gf,
+                                        &plan,
+                                        &effective_budget,
+                                        &streaming_policy)) {
                 free_compute_ctx();
                 return std::nullopt;
             }
             if (should_use_graph_cut_segmented_compute(plan)) {
-                if (stream_layers_enabled && !stream_policy_logged) {
-                    const size_t parameter_segments = static_cast<size_t>(std::count_if(
-                        plan.segments.begin(), plan.segments.end(), [](const GraphCutSegment& segment) {
-                            return segment.input_param_bytes > 0;
-                        }));
-                    LOG_INFO(
-                        "%s layer stream: %zu parameter segments, resident requested=%d selected=%zu, "
-                        "prefetch requested=%d selected=%zu",
-                        get_desc().c_str(),
-                        parameter_segments,
-                        resident_segment_limit,
-                        streaming_policy.resident_segments,
-                        segment_prefetch_depth,
-                        streaming_policy.prefetch_depth);
-                    stream_policy_logged = true;
-                }
-
                 return compute_graph_cut_segments<T>(gf,
                                                      plan,
                                                      n_threads,
                                                      stream_layers_enabled,
                                                      no_return,
-                                                     stream_layers_enabled && streaming_policy.prefetch_depth > 0
-                                                         ? &streaming_policy
-                                                         : nullptr);
+                                                     effective_budget,
+                                                     streaming_policy);
+            }
+            if (stream_layers_enabled && stream_layer_pool_enabled) {
+                LOG_ERROR(
+                    "%s streaming layer pool requires at least two valid graph-cut segments; inference cannot continue",
+                    get_desc().c_str());
+                free_compute_ctx();
+                return std::nullopt;
             }
             if (stream_layers_enabled &&
-                (resident_segment_limit >= 0 || segment_prefetch_depth > 0) &&
+                (resident_segment_limit >= 0 || segment_prefetch_depth > 0 ||
+                 stream_layer_pool_enabled) &&
                 !stream_limits_unavailable_warned) {
                 LOG_WARN("%s streaming limits require at least two valid graph-cut segments; using full-graph execution",
                          get_desc().c_str());
                 stream_limits_unavailable_warned = true;
             }
         }
-        clear_stream_prefetch_state();
-        if (!kept_compute_param_tensor_set.empty()) {
-            std::vector<ggml_tensor*> resident_params;
-            resident_params.reserve(kept_compute_param_tensor_set.size());
-            for (const ggml_tensor* tensor : kept_compute_param_tensor_set) {
-                resident_params.push_back(const_cast<ggml_tensor*>(tensor));
-            }
-            free_compute_backend_param_tensors(resident_params);
-            kept_compute_param_tensor_set.clear();
+        if (stream_layers_enabled && stream_layer_pool_enabled) {
+            LOG_ERROR(
+                "%s streaming layer pool is unavailable for this graph or runtime backend; inference cannot continue",
+                get_desc().c_str());
+            free_compute_ctx();
+            return std::nullopt;
         }
+        clear_stream_prefetch_state();
+        release_kept_stream_params();
+        clear_stream_pool_state();
         return execute_graph<T>(gf,
                                 n_threads,
                                 free_compute_buffer,
@@ -3806,6 +3970,11 @@ public:
                      get_desc().c_str());
             return;
         }
+        if (!enabled && stream_layers_enabled) {
+            clear_stream_prefetch_state();
+            release_kept_stream_params();
+            clear_stream_pool_state();
+        }
         stream_layers_enabled = enabled;
     }
 
@@ -3813,6 +3982,20 @@ public:
         resident_segment_limit           = std::max(-1, resident_segments);
         segment_prefetch_depth           = std::max(0, prefetch_depth);
         runtime_resident_segment_cap     = SIZE_MAX;
+        runtime_prefetch_depth_cap       = SIZE_MAX;
+        stream_policy_logged             = false;
+        stream_limits_unavailable_warned = false;
+    }
+
+    void set_stream_layer_pool_enabled(bool enabled) {
+        if (!enabled && stream_layer_pool_enabled) {
+            clear_stream_prefetch_state();
+            release_kept_stream_params();
+            clear_stream_pool_state();
+        }
+        stream_layer_pool_enabled        = enabled;
+        runtime_pool_slot_cap            = SIZE_MAX;
+        stream_pool_budget_warned        = false;
         stream_policy_logged             = false;
         stream_limits_unavailable_warned = false;
     }
@@ -3863,7 +4046,7 @@ public:
         if (is_multi_device() && stream_layers_enabled) {
             LOG_WARN("%s: --stream-layers is not supported with multiple runtime backends; ignoring",
                      get_desc().c_str());
-            stream_layers_enabled = false;
+            set_stream_layers_enabled(false);
         }
     }
 };

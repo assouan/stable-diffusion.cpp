@@ -87,7 +87,12 @@ int main(int argc, const char** argv) {
 
     sd_ctx_params_t sd_ctx_params                = ctx_params.to_sd_ctx_params_t(false);
     sd_layer_stream_params_t layer_stream_params = ctx_params.to_sd_layer_stream_params_t();
-    SDCtxPtr sd_ctx(new_sd_ctx_with_layer_stream(&sd_ctx_params, &layer_stream_params));
+    const uint32_t layer_stream_options          = ctx_params.stream_layer_pool
+                                                       ? SD_LAYER_STREAM_OPTION_POOL
+                                                       : SD_LAYER_STREAM_OPTION_NONE;
+    SDCtxPtr sd_ctx(new_sd_ctx_with_layer_stream_options(&sd_ctx_params,
+                                                         &layer_stream_params,
+                                                         layer_stream_options));
 
     if (sd_ctx == nullptr) {
         LOG_ERROR("new_sd_ctx_t failed");

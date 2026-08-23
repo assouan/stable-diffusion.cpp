@@ -25,6 +25,10 @@ namespace sd::ggml_graph_cut {
         return rhs > SIZE_MAX - lhs ? SIZE_MAX : lhs + rhs;
     }
 
+    static size_t saturating_multiply(size_t lhs, size_t rhs) {
+        return lhs != 0 && rhs > SIZE_MAX / lhs ? SIZE_MAX : lhs * rhs;
+    }
+
     static bool sum_fits(size_t lhs, size_t rhs, size_t limit) {
         return lhs <= limit && rhs <= limit - lhs;
     }
@@ -1129,17 +1133,136 @@ namespace sd::ggml_graph_cut {
         return peak;
     }
 
+    static size_t segment_pool_param_bytes(
+        const Segment& segment,
+        const std::unordered_map<const ggml_tensor*, size_t>& param_occurrences) {
+        size_t bytes = 0;
+        for (const Segment::ParamAllocation& allocation : segment.input_param_allocations) {
+            if (allocation.tensor == nullptr) {
+                continue;
+            }
+            auto occurrence = param_occurrences.find(allocation.tensor);
+            if (occurrence != param_occurrences.end() && occurrence->second == 1) {
+                bytes = saturating_add(bytes, allocation.bytes);
+            }
+        }
+        return bytes;
+    }
+
+    static void add_non_pool_segment_param_bytes(
+        const Plan& plan,
+        size_t segment_index,
+        const std::unordered_map<const ggml_tensor*, size_t>& param_occurrences,
+        std::unordered_set<const ggml_tensor*>& seen_params,
+        std::unordered_set<size_t>& seen_fallback_segments,
+        size_t& bytes) {
+        const Segment& segment = plan.segments[segment_index];
+        size_t described_bytes = 0;
+        for (const Segment::ParamAllocation& allocation : segment.input_param_allocations) {
+            described_bytes = saturating_add(described_bytes, allocation.bytes);
+            if (allocation.tensor == nullptr) {
+                bytes = saturating_add(bytes, allocation.bytes);
+                continue;
+            }
+            auto occurrence = param_occurrences.find(allocation.tensor);
+            if (occurrence != param_occurrences.end() && occurrence->second > 1 &&
+                seen_params.insert(allocation.tensor).second) {
+                bytes = saturating_add(bytes, allocation.bytes);
+            }
+        }
+
+        if (described_bytes < segment.input_param_bytes &&
+            seen_fallback_segments.insert(segment_index).second) {
+            bytes = saturating_add(bytes, segment.input_param_bytes - described_bytes);
+        }
+    }
+
+    static size_t peak_pooled_non_slot_bytes(
+        const Plan& plan,
+        const std::vector<size_t>& param_segments,
+        const std::unordered_map<const ggml_tensor*, size_t>& param_occurrences,
+        size_t resident_count) {
+        size_t peak = 0;
+        for (size_t segment_index = 0; segment_index < plan.segments.size(); ++segment_index) {
+            std::unordered_set<const ggml_tensor*> seen_params;
+            std::unordered_set<size_t> seen_fallback_segments;
+            size_t bytes = 0;
+            for (size_t resident_position = 0;
+                 resident_position < resident_count;
+                 ++resident_position) {
+                add_non_pool_segment_param_bytes(plan,
+                                                 param_segments[resident_position],
+                                                 param_occurrences,
+                                                 seen_params,
+                                                 seen_fallback_segments,
+                                                 bytes);
+            }
+            if (plan.segments[segment_index].input_param_bytes > 0) {
+                add_non_pool_segment_param_bytes(plan,
+                                                 segment_index,
+                                                 param_occurrences,
+                                                 seen_params,
+                                                 seen_fallback_segments,
+                                                 bytes);
+            }
+            const Segment& segment = plan.segments[segment_index];
+            bytes                  = saturating_add(bytes, segment.compute_buffer_size);
+            bytes                  = saturating_add(bytes, segment.output_bytes);
+            bytes                  = saturating_add(bytes, segment.input_previous_cut_bytes);
+            bytes                  = saturating_add(bytes, segment.input_external_bytes);
+            peak                   = std::max(peak, bytes);
+        }
+        return peak;
+    }
+
+    static size_t peak_stream_pool_slots(const std::vector<size_t>& pool_param_bytes,
+                                         size_t resident_count,
+                                         size_t prefetch_depth) {
+        if (pool_param_bytes.empty()) {
+            return 0;
+        }
+        prefetch_depth = pool_param_bytes.size() < 2
+                             ? 0
+                             : std::min(prefetch_depth, pool_param_bytes.size() - 1);
+
+        size_t peak = 0;
+        std::vector<size_t> seen_at_position(pool_param_bytes.size(), SIZE_MAX);
+        for (size_t active_position = 0; active_position < pool_param_bytes.size(); ++active_position) {
+            size_t loaded_segments = 0;
+            auto add_segment       = [&](size_t position) {
+                if (pool_param_bytes[position] > 0 &&
+                    seen_at_position[position] != active_position) {
+                    seen_at_position[position] = active_position;
+                    ++loaded_segments;
+                }
+            };
+            for (size_t resident_position = 0;
+                 resident_position < resident_count;
+                 ++resident_position) {
+                add_segment(resident_position);
+            }
+            add_segment(active_position);
+            for (size_t offset = 1; offset <= prefetch_depth; ++offset) {
+                add_segment((active_position + offset) % pool_param_bytes.size());
+            }
+            peak = std::max(peak, loaded_segments);
+        }
+        return peak;
+    }
+
     StreamingPolicy annotate_residency(Plan& plan,
                                        size_t max_graph_vram_bytes,
                                        int resident_segment_limit,
-                                       int segment_prefetch_depth) {
+                                       int segment_prefetch_depth,
+                                       bool stream_layer_pool,
+                                       size_t pool_slot_limit) {
         StreamingPolicy policy;
         // Cached plans may be reused with a smaller live budget.
         for (auto& seg : plan.segments) {
             seg.residency = SegmentResidency::STREAMED;
         }
 
-        if (max_graph_vram_bytes == 0) {
+        if (max_graph_vram_bytes == 0 && !stream_layer_pool) {
             return policy;
         }
 
@@ -1172,6 +1295,18 @@ namespace sd::ggml_graph_cut {
                                         : std::min(static_cast<size_t>(std::max(0, segment_prefetch_depth)),
                                                    param_segments.size() - 1);
 
+        std::vector<size_t> pool_param_bytes;
+        size_t pool_slot_bytes = 0;
+        if (stream_layer_pool) {
+            pool_param_bytes.reserve(param_segments.size());
+            for (size_t segment_index : param_segments) {
+                const size_t bytes = segment_pool_param_bytes(plan.segments[segment_index],
+                                                              param_occurrences);
+                pool_param_bytes.push_back(bytes);
+                pool_slot_bytes = std::max(pool_slot_bytes, bytes);
+            }
+        }
+
         size_t worst_non_param_footprint = 0;
         for (const auto& seg : plan.segments) {
             size_t seg_footprint = seg.compute_buffer_size;
@@ -1182,34 +1317,115 @@ namespace sd::ggml_graph_cut {
                 worst_non_param_footprint = seg_footprint;
             }
         }
-        constexpr size_t safety = 512ull * 1024 * 1024;
-        if (!sum_fits(safety, worst_non_param_footprint, max_graph_vram_bytes)) {
-            return policy;
+        const bool use_pool             = stream_layer_pool && pool_slot_bytes > 0;
+        policy.pool_slot_bytes          = pool_slot_bytes;
+        size_t pool_base_non_slot_bytes = 0;
+        if (use_pool) {
+            pool_base_non_slot_bytes    = peak_pooled_non_slot_bytes(plan,
+                                                                     param_segments,
+                                                                     param_occurrences,
+                                                                     0);
+            size_t available_pool_bytes = 0;
+            if (sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+                         pool_base_non_slot_bytes,
+                         max_graph_vram_bytes)) {
+                available_pool_bytes = max_graph_vram_bytes -
+                                       STREAMING_VRAM_SAFETY_MARGIN -
+                                       pool_base_non_slot_bytes;
+            }
+            const size_t private_segment_count = static_cast<size_t>(std::count_if(
+                pool_param_bytes.begin(),
+                pool_param_bytes.end(),
+                [](size_t bytes) { return bytes > 0; }));
+            const size_t budget_slots          = std::max<size_t>(1,
+                                                                  available_pool_bytes /
+                                                                      pool_slot_bytes);
+            policy.pool_slots                  = std::min({private_segment_count,
+                                                           budget_slots,
+                                                           std::max<size_t>(1, pool_slot_limit)});
+            policy.pool_minimum_exceeds_budget =
+                !sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+                          saturating_add(pool_base_non_slot_bytes, pool_slot_bytes),
+                          max_graph_vram_bytes);
+        } else {
+            if (!sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+                          worst_non_param_footprint,
+                          max_graph_vram_bytes)) {
+                return policy;
+            }
         }
-        const size_t base_reserved = safety + worst_non_param_footprint;
+        const size_t base_reserved = saturating_add(STREAMING_VRAM_SAFETY_MARGIN,
+                                                    worst_non_param_footprint);
 
         for (size_t candidate = 1; candidate <= prefetch_cap; ++candidate) {
-            const size_t peak_param_bytes = peak_streaming_param_bytes(plan,
-                                                                       param_segments,
-                                                                       param_occurrences,
-                                                                       0,
-                                                                       candidate);
-            if (!sum_fits(base_reserved, peak_param_bytes, max_graph_vram_bytes)) {
-                break;
+            if (use_pool) {
+                const size_t required_pool_slots = peak_stream_pool_slots(pool_param_bytes,
+                                                                          0,
+                                                                          candidate);
+                const size_t pool_bytes          = saturating_multiply(required_pool_slots,
+                                                                       pool_slot_bytes);
+                if (required_pool_slots > policy.pool_slots ||
+                    !sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+                              saturating_add(pool_bytes, pool_base_non_slot_bytes),
+                              max_graph_vram_bytes)) {
+                    break;
+                }
+            } else {
+                const size_t candidate_peak = peak_streaming_param_bytes(plan,
+                                                                         param_segments,
+                                                                         param_occurrences,
+                                                                         0,
+                                                                         candidate);
+                if (!sum_fits(base_reserved,
+                              candidate_peak,
+                              max_graph_vram_bytes)) {
+                    break;
+                }
             }
             policy.prefetch_depth = candidate;
         }
 
         for (size_t candidate = 1; candidate <= resident_cap; ++candidate) {
-            const size_t peak_param_bytes = peak_streaming_param_bytes(plan,
-                                                                       param_segments,
-                                                                       param_occurrences,
-                                                                       candidate,
-                                                                       policy.prefetch_depth);
-            if (!sum_fits(base_reserved, peak_param_bytes, max_graph_vram_bytes)) {
-                break;
+            if (use_pool) {
+                const size_t required_pool_slots = peak_stream_pool_slots(
+                    pool_param_bytes,
+                    candidate,
+                    policy.prefetch_depth);
+                if (required_pool_slots > policy.pool_slots) {
+                    break;
+                }
+                const size_t pool_bytes     = saturating_multiply(required_pool_slots,
+                                                                  policy.pool_slot_bytes);
+                const size_t non_pool_bytes = peak_pooled_non_slot_bytes(plan,
+                                                                         param_segments,
+                                                                         param_occurrences,
+                                                                         candidate);
+                const size_t candidate_peak = saturating_add(pool_bytes,
+                                                             non_pool_bytes);
+                if (!sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+                              candidate_peak,
+                              max_graph_vram_bytes)) {
+                    break;
+                }
+            } else {
+                const size_t candidate_peak = peak_streaming_param_bytes(plan,
+                                                                         param_segments,
+                                                                         param_occurrences,
+                                                                         candidate,
+                                                                         policy.prefetch_depth);
+                if (!sum_fits(base_reserved,
+                              candidate_peak,
+                              max_graph_vram_bytes)) {
+                    break;
+                }
             }
             policy.resident_segments = candidate;
+        }
+        if (use_pool) {
+            policy.pool_slots = std::max<size_t>(1,
+                                                 peak_stream_pool_slots(pool_param_bytes,
+                                                                        policy.resident_segments,
+                                                                        policy.prefetch_depth));
         }
         for (size_t i = 0; i < policy.resident_segments; ++i) {
             plan.segments[param_segments[i]].residency = SegmentResidency::RESIDENT;

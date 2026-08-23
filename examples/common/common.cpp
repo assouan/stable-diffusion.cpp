@@ -530,6 +530,10 @@ ArgOptions SDContextParams::get_options() {
          "enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram; defaults to false)",
          true, &stream_layers},
         {"",
+         "--stream-layer-pool",
+         "reuse one contiguous VRAM pool divided into slots sized to the largest streamed segment (defaults to false)",
+         true, &stream_layer_pool},
+        {"",
          "--eager-load",
          "load all params into the params backend at model-load time instead of lazily on first use (defaults to false)",
          true, &eager_load},
@@ -870,6 +874,7 @@ std::string SDContextParams::to_string() const {
         << "  stream_layers: " << (stream_layers ? "true" : "false") << ",\n"
         << "  resident_layers: " << resident_layers << ",\n"
         << "  layer_prefetch_depth: " << layer_prefetch_depth << ",\n"
+        << "  stream_layer_pool: " << (stream_layer_pool ? "true" : "false") << ",\n"
         << "  eager_load: " << (eager_load ? "true" : "false") << ",\n"
         << "  backend: \"" << backend << "\",\n"
         << "  params_backend: \"" << params_backend << "\",\n"

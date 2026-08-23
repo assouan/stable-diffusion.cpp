@@ -154,6 +154,7 @@ struct SDContextParams {
     std::string resident_layers_spec = "-1";
     int resident_layers              = -1;
     int layer_prefetch_depth         = 0;
+    bool stream_layer_pool           = false;
     bool eager_load                  = false;
     std::string backend;
     std::string params_backend;

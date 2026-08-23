@@ -250,6 +250,7 @@ public:
     bool stream_layers       = false;
     int resident_layers      = -1;
     int layer_prefetch_depth = 0;
+    bool stream_layer_pool   = false;
     bool eager_load          = false;
     std::string backend_spec;
     std::string params_backend_spec;
@@ -860,12 +861,24 @@ public:
     }
 
     bool init(const sd_ctx_params_t* sd_ctx_params,
-              const sd_layer_stream_params_t* layer_stream_params) {
+              const sd_layer_stream_params_t* layer_stream_params,
+              uint32_t layer_stream_options) {
+        constexpr uint32_t supported_layer_stream_options =
+            SD_LAYER_STREAM_OPTION_POOL;
+        const uint32_t unsupported_layer_stream_options =
+            layer_stream_options & ~supported_layer_stream_options;
+        if (unsupported_layer_stream_options != 0) {
+            LOG_ERROR("unsupported layer stream options: 0x%x",
+                      static_cast<unsigned int>(unsupported_layer_stream_options));
+            return false;
+        }
         n_threads            = sd_ctx_params->n_threads;
         enable_mmap          = sd_ctx_params->enable_mmap;
         stream_layers        = sd_ctx_params->stream_layers;
         resident_layers      = -1;
         layer_prefetch_depth = 0;
+        stream_layer_pool =
+            (layer_stream_options & SD_LAYER_STREAM_OPTION_POOL) != 0;
         if (layer_stream_params != nullptr) {
             constexpr size_t min_struct_size = offsetof(sd_layer_stream_params_t,
                                                         layer_prefetch_depth) +
@@ -883,10 +896,14 @@ public:
             LOG_ERROR("layer stream limits require resident_layers >= -1 and layer_prefetch_depth >= 0");
             return false;
         }
-        if (!stream_layers && (resident_layers >= 0 || layer_prefetch_depth > 0)) {
-            LOG_WARN("resident_layers and layer_prefetch_depth require stream_layers; ignoring layer stream limits");
+        if (!stream_layers &&
+            (resident_layers >= 0 || layer_prefetch_depth > 0 || stream_layer_pool)) {
+            LOG_WARN(
+                "resident_layers, layer_prefetch_depth, and stream_layer_pool require stream_layers; "
+                "ignoring layer stream controls");
             resident_layers      = -1;
             layer_prefetch_depth = 0;
+            stream_layer_pool    = false;
         }
         eager_load          = sd_ctx_params->eager_load;
         backend_spec        = SAFE_STR(sd_ctx_params->backend);
@@ -968,8 +985,11 @@ public:
             max_graph_vram_bytes_for_module(SDBackendModule::DIFFUSION) == 0) {
             LOG_WARN(
                 "--stream-layers has no effect because diffusion --max-vram is 0; "
-                "residency and prefetch controls are ignored");
+                "residency, prefetch, and pool controls are ignored");
             stream_layers = false;
+        }
+        if (!stream_layers) {
+            stream_layer_pool = false;
         }
         if (eager_load && graph_cut_layer_split_active()) {
             LOG_WARN("--eager-load is not supported with graph-cut layer split; weights will be prepared lazily");
@@ -1400,6 +1420,7 @@ public:
                 return false;
             }
             diffusion_model->set_stream_segment_limits(resident_layers, layer_prefetch_depth);
+            diffusion_model->set_stream_layer_pool_enabled(stream_layer_pool);
             diffusion_model->set_stream_layers_enabled(stream_layers);
 
             if (high_noise_diffusion_model) {
@@ -1411,6 +1432,7 @@ public:
                     return false;
                 }
                 high_noise_diffusion_model->set_stream_segment_limits(resident_layers, layer_prefetch_depth);
+                high_noise_diffusion_model->set_stream_layer_pool_enabled(stream_layer_pool);
                 high_noise_diffusion_model->set_stream_layers_enabled(stream_layers);
             }
 
@@ -3903,6 +3925,15 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
 
 sd_ctx_t* new_sd_ctx_with_layer_stream(const sd_ctx_params_t* sd_ctx_params,
                                        const sd_layer_stream_params_t* layer_stream_params) {
+    return new_sd_ctx_with_layer_stream_options(sd_ctx_params,
+                                                layer_stream_params,
+                                                SD_LAYER_STREAM_OPTION_NONE);
+}
+
+sd_ctx_t* new_sd_ctx_with_layer_stream_options(
+    const sd_ctx_params_t* sd_ctx_params,
+    const sd_layer_stream_params_t* layer_stream_params,
+    uint32_t layer_stream_options) {
     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
     if (sd_ctx == nullptr) {
         return nullptr;
@@ -3914,7 +3945,9 @@ sd_ctx_t* new_sd_ctx_with_layer_stream(const sd_ctx_params_t* sd_ctx_params,
         return nullptr;
     }
 
-    if (!sd_ctx->sd->init(sd_ctx_params, layer_stream_params)) {
+    if (!sd_ctx->sd->init(sd_ctx_params,
+                          layer_stream_params,
+                          layer_stream_options)) {
         delete sd_ctx->sd;
         sd_ctx->sd = nullptr;
         free(sd_ctx);

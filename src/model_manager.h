@@ -54,11 +54,40 @@ private:
         std::vector<TensorState*> states;
     };
 
+    struct StreamingPoolBuffer {
+        ggml_backend_buffer_t buffer = nullptr;
+        size_t capacity              = 0;
+
+        ~StreamingPoolBuffer() {
+            if (buffer != nullptr) {
+                ggml_backend_buffer_free(buffer);
+            }
+        }
+    };
+
+    struct StreamingPoolSlot {
+        uintptr_t owner_id = 0;
+        std::shared_ptr<StreamingPoolBuffer> pool_buffer;
+        size_t offset   = 0;
+        size_t capacity = 0;
+        bool in_use     = false;
+    };
+
+    struct StreamingPoolConfig {
+        ggml_backend_t compute_backend         = nullptr;
+        ggml_backend_buffer_type_t buffer_type = nullptr;
+        size_t slot_count                      = 0;
+        size_t slot_bytes                      = 0;
+        std::shared_ptr<StreamingPoolBuffer> pool_buffer;
+        std::vector<std::shared_ptr<StreamingPoolSlot>> slots;
+    };
+
     struct ComputeStagingBlock {
         ggml_backend_t compute_backend = nullptr;
         ggml_backend_buffer_t buffer   = nullptr;
         ggml_context* staging_ctx      = nullptr;
         std::vector<std::pair<TensorState*, ggml_tensor*>> staged_tensors;
+        std::shared_ptr<StreamingPoolSlot> pool_slot;
     };
 
     struct PrefetchKey {
@@ -80,6 +109,7 @@ private:
         ggml_context* staging_ctx       = nullptr;
         ggml_backend_buffer_t buffer    = nullptr;
         std::vector<std::pair<TensorState*, ggml_tensor*>> staged_tensors;
+        std::shared_ptr<StreamingPoolSlot> pool_slot;
     };
 
     ModelLoader model_loader_;
@@ -90,6 +120,7 @@ private:
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;
     std::map<PrefetchKey, std::unique_ptr<PrefetchBlock>> prefetch_blocks_;
     std::map<ggml_backend_t, ggml_backend_t> prefetch_backends_;
+    std::map<uintptr_t, StreamingPoolConfig> streaming_pool_configs_;
     bool warned_split_lora_skip_ = false;
     std::set<std::string> common_ignore_tensors_;
     std::vector<LoraSpec> loras_;
@@ -107,6 +138,14 @@ private:
     void synchronize_prefetch_block(PrefetchBlock& block);
     void free_prefetch_block(PrefetchBlock& block);
     void clear_all_param_prefetches();
+    ParamPrefetchResult acquire_streaming_pool_slot(
+        uintptr_t owner_id,
+        ggml_backend_t compute_backend,
+        ggml_backend_buffer_type_t buffer_type,
+        size_t required_bytes,
+        std::shared_ptr<StreamingPoolSlot>& slot);
+    void return_streaming_pool_slot(std::shared_ptr<StreamingPoolSlot>& slot);
+    void release_all_streaming_pools();
 
     bool resolve_required_tensor_states(const std::vector<ggml_tensor*>& tensors,
                                         std::vector<TensorState*>& required_states) const;
@@ -213,11 +252,17 @@ public:
     ParamPrefetchResult enqueue_param_prefetch(
         uintptr_t owner_id,
         uint64_t segment_id,
-        const std::vector<ggml_tensor*>& tensors) override;
+        const std::vector<ggml_tensor*>& tensors,
+        bool require_streaming_pool) override;
     bool activate_param_prefetch(uintptr_t owner_id,
                                  uint64_t segment_id,
                                  const std::vector<ggml_tensor*>& tensors) override;
     void clear_param_prefetches(uintptr_t owner_id) override;
+    StreamingPoolAllocation configure_streaming_pool(uintptr_t owner_id,
+                                                     ggml_backend_t compute_backend,
+                                                     size_t slot_count,
+                                                     size_t slot_bytes) override;
+    bool release_streaming_pool(uintptr_t owner_id) override;
     size_t streaming_allocation_bytes(
         uintptr_t owner_id,
         ggml_backend_t compute_backend,
