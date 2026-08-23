@@ -7,17 +7,29 @@ image/video/audio reference conditioning (Ref2VA).
 
 ## Model files
 
-Pass the four MiniMax-H3 components separately:
+Pass the MiniMax-H3 components separately:
 
 - `--diffusion-model`: MiniMax-H3 diffusion transformer
 - `--vae`: MiniMax-H3 video VAE
 - `--audio-vae`: MiniMax-H3 audio VAE
-- `--llm`: the MiniMax-H3 Qwen3-VL-32B text encoder checkpoint
+- `--llm`: a supported Qwen3-VL text encoder checkpoint
+- `--llm_projection`: optional ClipProj weights for a smaller text encoder
 
-The text encoder must be the MiniMax-H3 variant: Qwen3-VL-32B truncated to 50
-language layers and exported without the final language-model normalization.
-Its Qwen3-VL vision tower, including the three DeepStack mergers, must also be
-present. If the vision tower is stored separately, pass it with `--llm_vision`.
+The original text encoder is the MiniMax-H3 Qwen3-VL-32B variant, truncated to
+50 language layers and exported without the final language-model normalization.
+It can be used directly without `--llm_projection`.
+
+Qwen3-VL-4B is also supported with the learned
+`mmh3-4b-ClipProj-v3.1.safetensors` projection. The file selects its calibrated
+intermediate layer through Safetensors metadata, maps the 2560-wide hidden
+states to MiniMax-H3's 5120-wide conditioning, and restores the calibrated
+attention-sink token. Language layers after the calibrated tap are not loaded.
+This is a learned approximation of the original 32B conditioning, so prompt
+and reference fidelity can differ.
+
+In both cases, the Qwen3-VL vision tower and its three DeepStack mergers must be
+present for image and video inputs. If the vision tower is stored separately,
+pass it with `--llm_vision`.
 
 Both the original time-embedder DiT and the smaller AdaLN curve-table variant
 are detected from their weights.
@@ -30,6 +42,9 @@ are detected from their weights.
 - Download qwen3vl_32b_minimax_h3
     - safetensors: https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/text_encoders
     - gguf: https://huggingface.co/leejet/MiniMax-H3-GGUF/tree/main
+- Optional Qwen3-VL-4B + ClipProj alternative
+    - Qwen3-VL-4B INT8: https://huggingface.co/Winnougan/Comfy-Qwen3-VL-INT8
+    - ClipProj v3.1: https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3
 - Download vae
     - safetensors: https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae
 - Download audio vae
@@ -42,6 +57,16 @@ are detected from their weights.
 ```
 
 <video src=../assets/minimax-h3/t2av.mp4 controls="controls" muted="muted" type="video/mp4"></video>
+
+To use the 4B encoder instead, replace the 32B `--llm` argument with:
+
+```sh
+--llm ..\models\text_encoders\qwen3vl_4b_int8_convrot.safetensors --llm_projection ..\models\text_encoders\mmh3-4b-ClipProj-v3.1.safetensors
+```
+
+The same encoder and projection work with the FL2VA and Ref2VA diffusion
+models. The C API exposes this path through
+`new_sd_ctx_with_llm_projection()`.
 
 Omitting `--audio-vae` still runs the joint diffusion model but produces video without a
 decoded audio track.

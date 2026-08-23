@@ -1,7 +1,9 @@
 #include "safetensors_io.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -102,8 +104,10 @@ static ggml_type safetensors_dtype_to_ggml_type(const std::string& dtype) {
 
 struct ComfyQuantConfig {
     std::string format;
-    bool convrot   = false;
-    int group_size = 0;
+    bool convrot          = false;
+    int group_size        = 0;
+    bool has_scalar_scale = false;
+    float scalar_scale    = 1.f;
 };
 
 static bool read_comfy_quant_config(std::ifstream& file,
@@ -229,7 +233,44 @@ bool read_safetensors_file(const std::string& file_path,
         if (!read_comfy_quant_config(file, file_path, name, data_start + begin, end - begin, config, error)) {
             return false;
         }
+        // Some consumers must dequantize raw I8 weights while loading, before the scale tensor itself is loaded.
         const std::string module_name = name.substr(0, name.size() - std::string(".comfy_quant").size());
+        const auto scale_item         = header_.find(module_name + ".weight_scale");
+        if (config.format == "int8_tensorwise" && scale_item != header_.end() &&
+            scale_item->value("dtype", "") == "F32") {
+            const nlohmann::json& scale_shape = (*scale_item)["shape"];
+            bool scalar_scale                 = true;
+            for (const auto& dim : scale_shape) {
+                if (dim.get<size_t>() != 1) {
+                    scalar_scale = false;
+                    break;
+                }
+            }
+            if (scalar_scale) {
+                const size_t scale_begin = (*scale_item)["data_offsets"][0].get<size_t>();
+                const size_t scale_end   = (*scale_item)["data_offsets"][1].get<size_t>();
+                if (scale_begin > scale_end || scale_end > file_size_ - data_start ||
+                    scale_end - scale_begin != sizeof(float)) {
+                    set_error(error, "invalid scalar ComfyUI int8_tensorwise scale for module '" + module_name + "'");
+                    return false;
+                }
+                file.clear();
+                file.seekg((std::streamoff)(data_start + scale_begin), std::ios::beg);
+                uint8_t scale_data[sizeof(float)];
+                file.read(reinterpret_cast<char*>(scale_data), sizeof(scale_data));
+                if (!file) {
+                    set_error(error, "read scalar ComfyUI int8_tensorwise scale failed for module '" + module_name + "'");
+                    return false;
+                }
+                const uint32_t scale_bits = static_cast<uint32_t>(model_io::read_int(scale_data));
+                std::memcpy(&config.scalar_scale, &scale_bits, sizeof(config.scalar_scale));
+                if (!std::isfinite(config.scalar_scale)) {
+                    set_error(error, "non-finite scalar ComfyUI int8_tensorwise scale for module '" + module_name + "'");
+                    return false;
+                }
+                config.has_scalar_scale = true;
+            }
+        }
         comfy_quant_configs.emplace(module_name, std::move(config));
     }
 
@@ -311,15 +352,24 @@ bool read_safetensors_file(const std::string& file_path,
                 tensor_storage.is_int8_tensorwise      = true;
                 tensor_storage.int8_convrot            = config->second.convrot;
                 tensor_storage.int8_convrot_group_size = config->second.group_size;
+                tensor_storage.has_int8_scalar_scale   = config->second.has_scalar_scale;
+                tensor_storage.int8_scalar_scale       = config->second.scalar_scale;
             }
         } else if (ends_with(name, ".weight_scale")) {
             const std::string module_name = name.substr(0, name.size() - std::string(".weight_scale").size());
             auto config                   = comfy_quant_configs.find(module_name);
-            if (config != comfy_quant_configs.end() && config->second.format == "int8_tensorwise" &&
-                tensor_storage.n_dims == 2 && tensor_storage.ne[0] == 1) {
-                tensor_storage.ne[0]  = tensor_storage.ne[1];
-                tensor_storage.ne[1]  = 1;
-                tensor_storage.n_dims = 1;
+            if (config != comfy_quant_configs.end() && config->second.format == "int8_tensorwise") {
+                if (tensor_storage.nelements() == 1) {
+                    if (type != GGML_TYPE_F32) {
+                        set_error(error, "scalar ComfyUI int8_tensorwise scale is not F32: '" + name + "'");
+                        return false;
+                    }
+                    tensor_storage.n_dims = 1;
+                } else if (tensor_storage.n_dims == 2 && tensor_storage.ne[0] == 1) {
+                    tensor_storage.ne[0]  = tensor_storage.ne[1];
+                    tensor_storage.ne[1]  = 1;
+                    tensor_storage.n_dims = 1;
+                }
             }
         }
 

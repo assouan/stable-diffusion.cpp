@@ -1047,6 +1047,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear_i8_tensorwise(ggml_context* ctx,
                                                              int convrot_group_size,
                                                              float scale = 1.f) {
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (x->type == GGML_TYPE_I8 && scale == 1.f));
+    GGML_ASSERT(weight_scale != nullptr);
+    const int64_t weight_scale_elements = ggml_nelements(weight_scale);
+    GGML_ASSERT(weight_scale_elements == 1 || weight_scale_elements == w->ne[1]);
+    if (weight_scale_elements == 1) {
+        weight_scale = ggml_repeat_4d(ctx, weight_scale, w->ne[1], 1, 1, 1);
+    }
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
@@ -3428,10 +3434,12 @@ protected:
             enum ggml_type wtype = GGML_TYPE_F32;
             params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_features);
         }
-        auto weight_storage           = tensor_storage_map.find(prefix + "weight");
-        const bool is_int8_tensorwise = weight_storage != tensor_storage_map.end() && weight_storage->second.is_int8_tensorwise;
-        if ((allow_weight_scale || is_int8_tensorwise) && tensor_storage_map.find(prefix + "weight_scale") != tensor_storage_map.end()) {
-            params["weight_scale"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_features);
+        auto weight_storage             = tensor_storage_map.find(prefix + "weight");
+        const bool is_int8_tensorwise   = weight_storage != tensor_storage_map.end() && weight_storage->second.is_int8_tensorwise;
+        const auto weight_scale_storage = tensor_storage_map.find(prefix + "weight_scale");
+        if ((allow_weight_scale || is_int8_tensorwise) && weight_scale_storage != tensor_storage_map.end()) {
+            const int64_t weight_scale_size = weight_scale_storage->second.nelements() == 1 ? 1 : out_features;
+            params["weight_scale"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, weight_scale_size);
             has_weight_scale       = true;
         }
         if (is_int8_tensorwise) {
@@ -3551,7 +3559,13 @@ protected:
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map, const std::string prefix = "") override {
         enum ggml_type wtype = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
         if (!support_get_rows(wtype)) {
-            wtype = GGML_TYPE_F32;
+            const auto storage               = tensor_storage_map.find(prefix + "weight");
+            // GET_ROWS has no raw-I8 path; scalar tensorwise weights can be dequantized directly to F16.
+            const bool can_dequantize_to_f16 = storage != tensor_storage_map.end() &&
+                                               storage->second.is_int8_tensorwise &&
+                                               storage->second.has_int8_scalar_scale &&
+                                               !storage->second.int8_convrot;
+            wtype                            = can_dequantize_to_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
         }
         params["weight"] = ggml_new_tensor_2d(ctx, wtype, embedding_dim, num_embeddings);
     }

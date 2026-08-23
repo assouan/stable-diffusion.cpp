@@ -1488,6 +1488,10 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
     replace_with_prefix_map(name, prefix_map);
 
     if (sd_version_is_boogu_image(version) || sd_version_is_krea2(version) || sd_version_is_mage_flow(version) || sd_version_is_minimax_h3(version)) {
+        const std::string hf_language_prefix = "text_encoders.llm.model.language_model.";
+        if (starts_with(name, hf_language_prefix)) {
+            name = "text_encoders.llm.model." + name.substr(hf_language_prefix.size());
+        }
         const std::string hf_vision_prefix = "text_encoders.llm.model.visual.";
         if (starts_with(name, hf_vision_prefix)) {
             name = "text_encoders.llm.visual." + name.substr(hf_vision_prefix.size());

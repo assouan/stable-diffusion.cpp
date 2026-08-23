@@ -904,7 +904,8 @@ int main(int argc, const char* argv[]) {
         num_results = 1;
         results.push_back(gen_params.init_image.release());
     } else {
-        SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
+        SDCtxPtr sd_ctx(new_sd_ctx_with_llm_projection(&sd_ctx_params,
+                                                       ctx_params.llm_projection_path.c_str()));
 
         if (sd_ctx == nullptr) {
             LOG_INFO("new_sd_ctx_t failed");

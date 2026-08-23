@@ -86,7 +86,8 @@ int main(int argc, const char** argv) {
     LOG_DEBUG("%s", default_gen_params.to_string().c_str());
 
     sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(false);
-    SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
+    SDCtxPtr sd_ctx(new_sd_ctx_with_llm_projection(&sd_ctx_params,
+                                                   ctx_params.llm_projection_path.c_str()));
 
     if (sd_ctx == nullptr) {
         LOG_ERROR("new_sd_ctx_t failed");

@@ -1224,7 +1224,30 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     } else if (tensor_storage.is_i64) {
                         i64_to_i32_vec((int64_t*)read_buf, (int32_t*)target_buf, tensor_storage.nelements());
                     }
-                    if (tensor_storage.type != dst_tensor->type) {
+                    if (tensor_storage.type == GGML_TYPE_I8 &&
+                        tensor_storage.is_int8_tensorwise &&
+                        dst_tensor->type != GGML_TYPE_I8) {
+                        if ((dst_tensor->type != GGML_TYPE_F32 && dst_tensor->type != GGML_TYPE_F16) ||
+                            !tensor_storage.has_int8_scalar_scale ||
+                            tensor_storage.int8_convrot) {
+                            LOG_ERROR("unsupported dequantization for ComfyUI int8_tensorwise tensor '%s'",
+                                      tensor_storage.name.c_str());
+                            failed = true;
+                            return;
+                        }
+                        const int8_t* src = (const int8_t*)target_buf;
+                        if (dst_tensor->type == GGML_TYPE_F32) {
+                            float* dst = (float*)convert_buf;
+                            for (int64_t i = 0; i < tensor_storage.nelements(); ++i) {
+                                dst[i] = static_cast<float>(src[i]) * tensor_storage.int8_scalar_scale;
+                            }
+                        } else {
+                            ggml_fp16_t* dst = (ggml_fp16_t*)convert_buf;
+                            for (int64_t i = 0; i < tensor_storage.nelements(); ++i) {
+                                dst[i] = ggml_fp32_to_fp16(static_cast<float>(src[i]) * tensor_storage.int8_scalar_scale);
+                            }
+                        }
+                    } else if (tensor_storage.type != dst_tensor->type) {
                         if (convert_buf == nullptr) {
                             LOG_ERROR("read tensor data failed: too less memory for conversion");
                             failed = true;

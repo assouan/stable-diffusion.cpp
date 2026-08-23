@@ -21,6 +21,7 @@
 #include "core/ggml_extend.hpp"
 #include "json.hpp"
 #include "model/common/rope.hpp"
+#include "model/te/clip_proj.hpp"
 #include "model_loader.h"
 #include "model_manager.h"
 #include "tokenizers/bpe_tokenizer.h"
@@ -119,6 +120,24 @@ namespace LLM {
         LLMVisionConfig vision;
         bool have_vision_weight = false;
         bool llama_cpp_style    = false;
+        std::optional<ClipProjConfig> output_projection;
+
+        bool configure_output_projection(const String2TensorStorage& tensor_storage_map,
+                                         const std::string& prefix,
+                                         int tap_layer,
+                                         int64_t target_dim,
+                                         std::string& error) {
+            ClipProjConfig projection;
+            projection.tap_layer = tap_layer;
+            if (!ClipProjConfig::detect(tensor_storage_map, prefix, projection, error) ||
+                !projection.validate(hidden_size, num_layers, target_dim, error)) {
+                return false;
+            }
+            num_layers        = projection.tap_layer;
+            final_norm        = false;
+            output_projection = std::move(projection);
+            return true;
+        }
 
         static LLMConfig detect_from_weights(const String2TensorStorage& tensor_storage_map,
                                              const std::string& prefix,
@@ -196,6 +215,9 @@ namespace LLM {
             int detected_vision_layers = 0;
             for (const auto& [name, tensor_storage] : tensor_storage_map) {
                 if (!starts_with(name, prefix)) {
+                    continue;
+                }
+                if (ends_with(name, ".weight_scale")) {
                     continue;
                 }
                 size_t pos = name.find("visual.");
@@ -1478,6 +1500,9 @@ namespace LLM {
             if (enable_vision) {
                 blocks["visual"] = std::shared_ptr<GGMLBlock>(new VisionModel(llama_cpp_style, config.vision));
             }
+            if (config.output_projection.has_value()) {
+                blocks["output_projection"] = std::make_shared<ClipProj>(*config.output_projection);
+            }
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -1490,7 +1515,12 @@ namespace LLM {
                              std::set<int> out_layers,
                              bool return_all_hidden_states = false) {
             // input_ids: [N, n_token]
-            auto model = std::dynamic_pointer_cast<TextModel>(blocks["model"]);
+            auto model      = std::dynamic_pointer_cast<TextModel>(blocks["model"]);
+            auto projection = blocks.find("output_projection");
+            if (projection != blocks.end()) {
+                GGML_ASSERT(!return_all_hidden_states);
+                out_layers = {config.output_projection->tap_layer};
+            }
 
             auto x = model->forward(ctx,
                                     input_ids,
@@ -1501,6 +1531,9 @@ namespace LLM {
                                     deepstack_image_embeds,
                                     out_layers,
                                     return_all_hidden_states);
+            if (projection != blocks.end()) {
+                x = std::dynamic_pointer_cast<ClipProj>(projection->second)->forward(ctx, x);
+            }
             return x;
         }
 
@@ -1756,10 +1789,14 @@ namespace LLM {
                   const String2TensorStorage& tensor_storage_map,
                   const std::string prefix,
                   bool enable_vision_                                 = false,
-                  std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+                  std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                  const LLMConfig* config_override                    = nullptr)
             : GGMLRunner(backend, weight_manager),
-              config(LLMConfig::detect_from_weights(tensor_storage_map, prefix, arch)),
+              config(config_override == nullptr
+                         ? LLMConfig::detect_from_weights(tensor_storage_map, prefix, arch)
+                         : *config_override),
               enable_vision(enable_vision_) {
+            GGML_ASSERT(config.arch == arch);
             if (enable_vision && !config.have_vision_weight) {
                 LOG_WARN("no vision weights detected, vision disabled");
                 enable_vision = false;
@@ -1795,16 +1832,15 @@ namespace LLM {
                              const std::vector<std::vector<std::pair<int, ggml_tensor*>>>& deepstack_image_embeds,
                              std::set<int> out_layers,
                              bool return_all_hidden_states = false) {
-            auto hidden_states = model.forward(ctx,
-                                               input_ids,
-                                               input_pos,
-                                               attention_mask,
-                                               sliding_attention_mask,
-                                               image_embeds,
-                                               deepstack_image_embeds,
-                                               out_layers,
-                                               return_all_hidden_states);  // [N, n_token, hidden_size]
-            return hidden_states;
+            return model.forward(ctx,
+                                 input_ids,
+                                 input_pos,
+                                 attention_mask,
+                                 sliding_attention_mask,
+                                 image_embeds,
+                                 deepstack_image_embeds,
+                                 out_layers,
+                                 return_all_hidden_states);
         }
 
         ggml_tensor* vision_forward(GGMLRunnerContext* ctx,

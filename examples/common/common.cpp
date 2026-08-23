@@ -368,6 +368,11 @@ ArgOptions SDContextParams::get_options() {
          0,
          &llm_vision_path},
         {"",
+         "--llm_projection",
+         "path to ClipProj weights for the llm text encoder",
+         0,
+         &llm_projection_path},
+        {"",
          "--qwen2vl",
          "alias of --llm. Deprecated.",
          0,
@@ -810,6 +815,7 @@ std::string SDContextParams::to_string() const {
         << "  t5xxl_path: \"" << t5xxl_path << "\",\n"
         << "  llm_path: \"" << llm_path << "\",\n"
         << "  llm_vision_path: \"" << llm_vision_path << "\",\n"
+        << "  llm_projection_path: \"" << llm_projection_path << "\",\n"
         << "  diffusion_model_path: \"" << diffusion_model_path << "\",\n"
         << "  high_noise_diffusion_model_path: \"" << high_noise_diffusion_model_path << "\",\n"
         << "  uncond_diffusion_model_path: \"" << uncond_diffusion_model_path << "\",\n"
@@ -2896,6 +2902,7 @@ std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
     set_json_basename_if_not_empty(models, "t5xxl", ctx_params.t5xxl_path);
     set_json_basename_if_not_empty(models, "llm", ctx_params.llm_path);
     set_json_basename_if_not_empty(models, "llm_vision", ctx_params.llm_vision_path);
+    set_json_basename_if_not_empty(models, "llm_projection", ctx_params.llm_projection_path);
     set_json_basename_if_not_empty(models, "diffusion_model", ctx_params.diffusion_model_path);
     set_json_basename_if_not_empty(models, "high_noise_diffusion_model", ctx_params.high_noise_diffusion_model_path);
     set_json_basename_if_not_empty(models, "uncond_diffusion_model", ctx_params.uncond_diffusion_model_path);
@@ -3075,6 +3082,9 @@ std::string get_image_params(const SDContextParams& ctx_params,
         if (!te.empty()) {
             parameter_string += "TE: " + sd_basename(te) + ", ";
         }
+    }
+    if (!ctx_params.llm_projection_path.empty()) {
+        parameter_string += "ClipProj: " + sd_basename(ctx_params.llm_projection_path) + ", ";
     }
     if (!ctx_params.diffusion_model_path.empty()) {
         parameter_string += "Unet: " + sd_basename(ctx_params.diffusion_model_path) + ", ";

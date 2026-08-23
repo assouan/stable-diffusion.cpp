@@ -123,6 +123,7 @@ struct SDContextParams {
     std::string t5xxl_path;
     std::string llm_path;
     std::string llm_vision_path;
+    std::string llm_projection_path;
     std::string diffusion_model_path;
     std::string high_noise_diffusion_model_path;
     std::string uncond_diffusion_model_path;

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <optional>
 #include <set>
 #include <type_traits>
 #include <unordered_set>
@@ -708,7 +709,8 @@ public:
                            const sd_ctx_params_t* sd_ctx_params,
                            bool& use_tae,
                            bool& use_audio_vae,
-                           bool& use_control_net) {
+                           bool& use_control_net,
+                           const char* llm_projection_path) {
         if (strlen(SAFE_STR(sd_ctx_params->model_path)) > 0) {
             LOG_INFO("loading model from '%s'", sd_ctx_params->model_path);
             if (!model_loader.init_from_file(sd_ctx_params->model_path)) {
@@ -846,6 +848,15 @@ public:
             }
         }
 
+        // ModelLoader exposes metadata for the most recently loaded file, so keep the projection last.
+        if (strlen(SAFE_STR(llm_projection_path)) > 0) {
+            LOG_INFO("loading LLM projection from '%s'", llm_projection_path);
+            if (!model_loader.init_from_file(llm_projection_path, "text_encoders.llm.output_projection.")) {
+                LOG_ERROR("loading LLM projection from '%s' failed", llm_projection_path);
+                return false;
+            }
+        }
+
         model_loader.convert_tensors_name();
 
         ggml_type wtype               = sd_type_to_ggml_type(sd_ctx_params->wtype);
@@ -857,7 +868,7 @@ public:
         return true;
     }
 
-    bool init(const sd_ctx_params_t* sd_ctx_params) {
+    bool init(const sd_ctx_params_t* sd_ctx_params, const char* llm_projection_path = nullptr) {
         n_threads           = sd_ctx_params->n_threads;
         enable_mmap         = sd_ctx_params->enable_mmap;
         stream_layers       = sd_ctx_params->stream_layers;
@@ -896,7 +907,12 @@ public:
         model_manager->set_enable_mmap(enable_mmap);
         ModelLoader& model_loader = model_manager->loader();
 
-        if (!init_model_loader(model_loader, sd_ctx_params, use_tae, use_audio_vae, use_control_net)) {
+        if (!init_model_loader(model_loader,
+                               sd_ctx_params,
+                               use_tae,
+                               use_audio_vae,
+                               use_control_net,
+                               llm_projection_path)) {
             return false;
         }
 
@@ -906,6 +922,51 @@ public:
             return false;
         } else {
             LOG_INFO("Version: %s ", model_version_to_str[version]);
+        }
+
+        const bool has_llm_projection = strlen(SAFE_STR(llm_projection_path)) > 0;
+        if (has_llm_projection && !sd_version_is_minimax_h3(version)) {
+            LOG_ERROR("LLM projection is only supported with MiniMax-H3");
+            return false;
+        }
+        std::optional<LLM::LLMConfig> minimax_h3_llm_config;
+        if (sd_version_is_minimax_h3(version)) {
+            auto llm_config = LLM::LLMConfig::detect_from_weights(model_loader.get_tensor_storage_map(),
+                                                                  "text_encoders.llm",
+                                                                  LLM::LLMArch::QWEN3_VL);
+            auto h3_config  = MiniMaxH3::Config::detect_from_weights(model_loader.get_tensor_storage_map(),
+                                                                     "model.diffusion_model");
+            if (has_llm_projection) {
+                int llm_projection_tap_layer = -1;
+                const auto& metadata          = model_loader.get_metadata();
+                auto tap                      = metadata.find("tap");
+                if (tap == metadata.end() ||
+                    !parse_strict_int(tap->second, llm_projection_tap_layer) ||
+                    llm_projection_tap_layer <= 0) {
+                    LOG_ERROR("ClipProj metadata must contain a positive integer 'tap'");
+                    return false;
+                }
+                std::string projection_error;
+                if (!llm_config.configure_output_projection(model_loader.get_tensor_storage_map(),
+                                                            "text_encoders.llm.output_projection",
+                                                            llm_projection_tap_layer,
+                                                            h3_config.text_dim,
+                                                            projection_error)) {
+                    LOG_ERROR("invalid ClipProj: %s", projection_error.c_str());
+                    return false;
+                }
+                const auto& projection_config = *llm_config.output_projection;
+                LOG_INFO("ClipProj: layer %d, %" PRId64 " -> %" PRId64,
+                         projection_config.tap_layer,
+                         projection_config.input_dim,
+                         projection_config.output_dim);
+            } else if (llm_config.hidden_size != h3_config.text_dim) {
+                LOG_ERROR("LLM hidden size (%" PRId64 ") does not match the MiniMax-H3 text dimension (%" PRId64 "); a matching ClipProj is required",
+                          llm_config.hidden_size,
+                          h3_config.text_dim);
+                return false;
+            }
+            minimax_h3_llm_config = std::move(llm_config);
         }
 
         if (auto_fit_enabled) {
@@ -1145,7 +1206,8 @@ public:
                                                                  version,
                                                                  "",
                                                                  true,
-                                                                 model_manager);
+                                                                 model_manager,
+                                                                 &*minimax_h3_llm_config);
                 diffusion_model  = std::make_shared<MiniMaxH3::MiniMaxH3Runner>(backend_for(SDBackendModule::DIFFUSION),
                                                                                tensor_storage_map,
                                                                                "model.diffusion_model",
@@ -3844,7 +3906,8 @@ static bool sd_version_supports_image_generation(SDVersion version) {
     return !sd_version_supports_video_generation(version);
 }
 
-sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+sd_ctx_t* new_sd_ctx_with_llm_projection(const sd_ctx_params_t* sd_ctx_params,
+                                         const char* llm_projection_path) {
     sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
     if (sd_ctx == nullptr) {
         return nullptr;
@@ -3856,13 +3919,17 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
         return nullptr;
     }
 
-    if (!sd_ctx->sd->init(sd_ctx_params)) {
+    if (!sd_ctx->sd->init(sd_ctx_params, llm_projection_path)) {
         delete sd_ctx->sd;
         sd_ctx->sd = nullptr;
         free(sd_ctx);
         return nullptr;
     }
     return sd_ctx;
+}
+
+sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
+    return new_sd_ctx_with_llm_projection(sd_ctx_params, nullptr);
 }
 
 void free_sd_ctx(sd_ctx_t* sd_ctx) {

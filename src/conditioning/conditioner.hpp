@@ -1817,7 +1817,8 @@ struct LLMEmbedder : public Conditioner {
                 SDVersion version                                   = VERSION_QWEN_IMAGE,
                 const std::string prefix                            = "",
                 bool enable_vision                                  = false,
-                std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+                std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                const LLM::LLMConfig* config_override               = nullptr)
         : version(version) {
         LLM::LLMArch arch = LLM::LLMArch::QWEN2_5_VL;
         if (version == VERSION_FLUX2) {
@@ -1853,7 +1854,8 @@ struct LLMEmbedder : public Conditioner {
                                                tensor_storage_map,
                                                "text_encoders.llm",
                                                enable_vision,
-                                               weight_manager);
+                                               weight_manager,
+                                               config_override);
         if (sd_version_is_hunyuan_video(version)) {
             const std::string byt5_prefix = "text_encoders.t5xxl.transformer";
             for (const auto& [name, _] : tensor_storage_map) {
