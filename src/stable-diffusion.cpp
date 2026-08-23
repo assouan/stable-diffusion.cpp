@@ -2594,6 +2594,16 @@ public:
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
                              const sd::Tensor<float>& video_positions = {}) {
+        struct SamplingDoneOnExit {
+            DiffusionModelRunner* runner = nullptr;
+            ~SamplingDoneOnExit() {
+                if (runner != nullptr) {
+                    runner->sampling_done();
+                }
+            }
+        };
+        SamplingDoneOnExit sample_diffusion_sampling_done{work_diffusion_model.get()};
+
         struct RunnerDoneOnExit {
             GGMLRunner* runner = nullptr;
             ~RunnerDoneOnExit() {
@@ -2605,7 +2615,6 @@ public:
         RunnerDoneOnExit sample_diffusion_runner_done{work_diffusion_model.get()};
         // Residency only pays off across the repeated denoising forwards.
         work_diffusion_model->set_stream_residency_enabled(true);
-
         RunnerDoneOnExit sample_control_runner_done{!control_image.empty() && control_net != nullptr ? control_net.get() : nullptr};
 
         std::vector<int> skip_layers(guidance.slg.layers, guidance.slg.layers + guidance.slg.layer_count);
@@ -2780,10 +2789,11 @@ public:
                                      const std::vector<int>* local_skip_layers                  = nullptr,
                                      const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr,
                                      bool use_uncond_ip                                         = false) -> sd::Tensor<float> {
-                diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
-                diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
-                diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
-                diffusion_params.ref_latents = ref_latents_override != nullptr ? ref_latents_override : (condition.c_ref_images.empty() ? &ref_latents : &condition.c_ref_images);
+                diffusion_params.context                = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
+                diffusion_params.context_cache_identity = &condition;
+                diffusion_params.c_concat               = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
+                diffusion_params.y                      = condition.c_vector.empty() ? nullptr : &condition.c_vector;
+                diffusion_params.ref_latents            = ref_latents_override != nullptr ? ref_latents_override : (condition.c_ref_images.empty() ? &ref_latents : &condition.c_ref_images);
 
                 if (sd_version_is_unet(version)) {
                     int nvf = -1;
