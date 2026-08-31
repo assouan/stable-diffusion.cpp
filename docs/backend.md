@@ -190,7 +190,7 @@ For example:
 sd-cli -m model.safetensors -p "a cat" --backend cuda0 --params-backend disk
 ```
 
-This runs all modules on `cuda0`, reloads parameters from the model file as needed, and releases those parameter buffers after use.
+This runs all modules on `cuda0`, reloads parameters from the model file as needed, and releases those parameter buffers after use. When the diffusion model also uses `--stream-layers`, Linux can load compatible tensors with `O_DIRECT` through bounded pinned staging buffers instead of retaining the model in system RAM. Unsupported file layouts, filesystems, and platforms use buffered reads automatically.
 
 `disk` is never selected implicitly. If `--params-backend` is not set, parameters use the runtime backend.
 

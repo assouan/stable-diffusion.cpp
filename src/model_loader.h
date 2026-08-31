@@ -27,16 +27,38 @@ struct MmapTensorStore {
     std::shared_ptr<struct ggml_backend_buffer> mmbuffer;
 };
 
+struct DirectStorageLoadStats {
+    uint64_t payload_bytes       = 0;
+    uint64_t storage_bytes       = 0;
+    uint64_t staging_bytes       = 0;
+    size_t tensor_count          = 0;
+    size_t direct_tensor_count   = 0;
+    size_t buffered_tensor_count = 0;
+    size_t staging_buffer_count  = 0;
+    size_t storage_request_count = 0;
+    bool aio_used                = false;
+    double total_seconds         = 0.0;
+    double setup_seconds         = 0.0;
+    double read_seconds          = 0.0;
+    double copy_seconds          = 0.0;
+    double wait_seconds          = 0.0;
+    double buffered_seconds      = 0.0;
+    std::string error;
+};
+
 bool is_unused_tensor(const std::string& name);
 
 class ModelLoader {
 protected:
+    struct DirectStorageBufferCache;
+
     SDVersion version_ = VERSION_COUNT;
     std::vector<std::string> file_paths_;
     std::vector<ModelFileData> file_data;
     bool model_files_processed = false;
     String2TensorStorage tensor_storage_map;
     std::map<std::string, std::string> metadata_;
+    std::unique_ptr<DirectStorageBufferCache> direct_storage_buffers_;
     int n_threads_;
 
     size_t add_file_path(const std::string& file_path);
@@ -51,6 +73,7 @@ protected:
 
 public:
     ModelLoader();
+    ~ModelLoader();
 
     bool init_from_file(const std::string& file_path, const std::string& prefix = "");
     void convert_tensors_name();
@@ -78,6 +101,12 @@ public:
     bool load_tensors(std::map<std::string, ggml_tensor*>& tensors,
                       std::set<std::string> ignore_tensors = {},
                       bool use_mmap                        = false);
+    bool load_tensors_direct(const std::map<std::string, ggml_tensor*>& tensors,
+                             ggml_backend_t transfer_backend,
+                             DirectStorageLoadStats* stats = nullptr);
+    void release_direct_storage_buffers();
+    bool prepare_direct_storage_buffers(ggml_backend_t transfer_backend,
+                                        DirectStorageLoadStats* stats = nullptr);
     bool load_float_tensor(const std::string& name,
                            std::vector<float>& data,
                            int n_threads = 0,
@@ -94,7 +123,6 @@ public:
 
     bool tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type);
     int64_t get_params_mem_size(ggml_backend_t backend, ggml_type type = GGML_TYPE_COUNT);
-    ~ModelLoader() = default;
 };
 
 #endif  // __MODEL_LOADER_H__

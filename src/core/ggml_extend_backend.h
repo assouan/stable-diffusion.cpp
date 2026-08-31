@@ -42,7 +42,15 @@ using SDBackendHandle = std::unique_ptr<struct ggml_backend, SDBackendHandleDele
 enum class SDSplitMode {
     LAYER,
     ROW,
+    SEQUENCE,
 };
+
+enum class SDTensorParallelPolicy {
+    NONE,
+    MINIMAX_H3,
+};
+
+struct SDMetaBackendState;
 
 class SDBackendManager {
 private:
@@ -50,9 +58,11 @@ private:
     SDBackendAssignment params_assignment_;
     SDBackendAssignment split_mode_assignment_;
     std::unordered_map<std::string, SDBackendHandle> backends_;
+    std::unordered_map<SDBackendModule, SDTensorParallelPolicy> tensor_parallel_policies_;
+    std::unordered_map<SDBackendModule, std::unique_ptr<SDMetaBackendState>> meta_backends_;
 
 public:
-    SDBackendManager() = default;
+    SDBackendManager();
     ~SDBackendManager();
 
     SDBackendManager(const SDBackendManager&)            = delete;
@@ -70,6 +80,8 @@ public:
     std::vector<ggml_backend_t> runtime_backends(SDBackendModule module);
 
     SDSplitMode split_mode(SDBackendModule module) const;
+    void set_tensor_parallel_policy(SDBackendModule module, SDTensorParallelPolicy policy);
+    bool tensor_parallel_active(SDBackendModule module) const;
     ggml_backend_buffer_type_t split_buffer_type(ggml_backend_t backend,
                                                  const std::vector<float>& tensor_split);
 
@@ -82,10 +94,14 @@ public:
 private:
     bool validate(std::string* error) const;
     ggml_backend_t init_cached_backend(const std::string& name);
+    ggml_backend_t init_meta_backend(SDBackendModule module);
 };
 
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);
 bool sd_backend_is_cpu(ggml_backend_t backend);
+bool sd_backend_alias_tensor(ggml_backend_t backend,
+                             const ggml_tensor* source,
+                             ggml_tensor* alias);
 ggml_backend_t sd_backend_cpu_init();
 bool sd_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads);
 ggml_status sd_backend_graph_compute_with_eval_callback(ggml_backend_t backend,

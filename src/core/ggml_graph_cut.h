@@ -73,15 +73,18 @@ namespace sd::ggml_graph_cut {
         size_t budgeted_graph_cut_plan_max_vram_bytes = 0;
     };
 
+    static constexpr size_t STREAMING_VRAM_SAFETY_MARGIN = 512ull * 1024 * 1024;
+
     struct StreamingPolicy {
         size_t resident_segments         = 0;
         size_t prefetch_depth            = 0;
         size_t pool_slots                = 0;
         size_t pool_slot_bytes           = 0;
+        size_t pool_base_non_slot_bytes  = 0;
+        size_t pool_available_bytes      = 0;
+        size_t safety_margin_bytes       = STREAMING_VRAM_SAFETY_MARGIN;
         bool pool_minimum_exceeds_budget = false;
     };
-
-    static constexpr size_t STREAMING_VRAM_SAFETY_MARGIN = 512ull * 1024 * 1024;
 
     static constexpr const char* GGML_RUNNER_CUT_PREFIX = "ggml_runner_cut:";
     static constexpr const char* GGML_RUNNER_CUT_SUFFIX = "|";
@@ -145,7 +148,8 @@ namespace sd::ggml_graph_cut {
                                        int resident_segment_limit,
                                        int segment_prefetch_depth,
                                        bool stream_layer_pool,
-                                       size_t pool_slot_limit = SIZE_MAX);
+                                       size_t pool_slot_limit       = SIZE_MAX,
+                                       size_t safety_margin_bytes   = STREAMING_VRAM_SAFETY_MARGIN);
 }  // namespace sd::ggml_graph_cut
 
 #endif  // __SD_CORE_GGML_GRAPH_CUT_H__

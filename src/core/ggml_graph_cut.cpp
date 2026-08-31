@@ -1255,8 +1255,10 @@ namespace sd::ggml_graph_cut {
                                        int resident_segment_limit,
                                        int segment_prefetch_depth,
                                        bool stream_layer_pool,
-                                       size_t pool_slot_limit) {
+                                       size_t pool_slot_limit,
+                                       size_t safety_margin_bytes) {
         StreamingPolicy policy;
+        policy.safety_margin_bytes = safety_margin_bytes;
         // Cached plans may be reused with a smaller live budget.
         for (auto& seg : plan.segments) {
             seg.residency = SegmentResidency::STREAMED;
@@ -1326,13 +1328,15 @@ namespace sd::ggml_graph_cut {
                                                                      param_occurrences,
                                                                      0);
             size_t available_pool_bytes = 0;
-            if (sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+            if (sum_fits(safety_margin_bytes,
                          pool_base_non_slot_bytes,
                          max_graph_vram_bytes)) {
                 available_pool_bytes = max_graph_vram_bytes -
-                                       STREAMING_VRAM_SAFETY_MARGIN -
+                                       safety_margin_bytes -
                                        pool_base_non_slot_bytes;
             }
+            policy.pool_base_non_slot_bytes = pool_base_non_slot_bytes;
+            policy.pool_available_bytes     = available_pool_bytes;
             const size_t private_segment_count = static_cast<size_t>(std::count_if(
                 pool_param_bytes.begin(),
                 pool_param_bytes.end(),
@@ -1344,17 +1348,17 @@ namespace sd::ggml_graph_cut {
                                                            budget_slots,
                                                            std::max<size_t>(1, pool_slot_limit)});
             policy.pool_minimum_exceeds_budget =
-                !sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+                !sum_fits(safety_margin_bytes,
                           saturating_add(pool_base_non_slot_bytes, pool_slot_bytes),
                           max_graph_vram_bytes);
         } else {
-            if (!sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+            if (!sum_fits(safety_margin_bytes,
                           worst_non_param_footprint,
                           max_graph_vram_bytes)) {
                 return policy;
             }
         }
-        const size_t base_reserved = saturating_add(STREAMING_VRAM_SAFETY_MARGIN,
+        const size_t base_reserved = saturating_add(safety_margin_bytes,
                                                     worst_non_param_footprint);
 
         for (size_t candidate = 1; candidate <= prefetch_cap; ++candidate) {
@@ -1365,7 +1369,7 @@ namespace sd::ggml_graph_cut {
                 const size_t pool_bytes          = saturating_multiply(required_pool_slots,
                                                                        pool_slot_bytes);
                 if (required_pool_slots > policy.pool_slots ||
-                    !sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+                    !sum_fits(safety_margin_bytes,
                               saturating_add(pool_bytes, pool_base_non_slot_bytes),
                               max_graph_vram_bytes)) {
                     break;
@@ -1402,7 +1406,7 @@ namespace sd::ggml_graph_cut {
                                                                          candidate);
                 const size_t candidate_peak = saturating_add(pool_bytes,
                                                              non_pool_bytes);
-                if (!sum_fits(STREAMING_VRAM_SAFETY_MARGIN,
+                if (!sum_fits(safety_margin_bytes,
                               candidate_peak,
                               max_graph_vram_bytes)) {
                     break;

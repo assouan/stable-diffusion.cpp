@@ -724,6 +724,16 @@ struct LoraModel : public GGMLRunner {
                 if (is_conv2d && lora_up->type != GGML_TYPE_F16) {
                     lora_up = ggml_cast(ctx, lora_up, GGML_TYPE_F16);
                 }
+                if (!is_conv2d && forward_params.linear.output_end >= 0) {
+                    GGML_ASSERT(forward_params.linear.output_start >= 0 &&
+                                forward_params.linear.output_end <= lora_up->ne[1]);
+                    lora_up = ggml_ext_slice(ctx,
+                                             lora_up,
+                                             1,
+                                             forward_params.linear.output_start,
+                                             forward_params.linear.output_end,
+                                             false);
+                }
             }
 
             iter = lora_tensors.find(lora_mid_name);
@@ -1098,6 +1108,37 @@ public:
             }
         }
         return output;
+    }
+
+    bool supports_linear_output_slice(const std::string& prefix,
+                                      int64_t output_start,
+                                      int64_t output_end,
+                                      int64_t full_output_size) const override {
+        GGML_ASSERT(output_start >= 0 && output_start < output_end && output_end <= full_output_size);
+        const std::string tensor_prefix = "lora." + prefix;
+        const std::string weight_prefix = tensor_prefix + "weight.";
+        for (const auto& lora_model : lora_models) {
+            for (const auto& [name, tensor] : lora_model->lora_tensors) {
+                if (!starts_with(name, tensor_prefix)) {
+                    continue;
+                }
+                if (name.find(".diff", tensor_prefix.size()) != std::string::npos ||
+                    name.find(".hada_", tensor_prefix.size()) != std::string::npos ||
+                    name.find(".lokr_", tensor_prefix.size()) != std::string::npos) {
+                    return false;
+                }
+                if (starts_with(name, weight_prefix)) {
+                    const std::string suffix = name.substr(weight_prefix.size());
+                    if (!suffix.empty() && suffix.front() >= '0' && suffix.front() <= '9') {
+                        return false;
+                    }
+                    if (starts_with(suffix, "lora_up") && tensor->ne[1] != full_output_size) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     size_t get_extra_graph_size() override {

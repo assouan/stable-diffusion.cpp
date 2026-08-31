@@ -226,9 +226,9 @@ typedef struct {
     bool vae_conv_direct;
     bool force_sdxl_vae_conv_scale;
     enum sd_vae_format_t vae_format;
-    const char* max_vram;  // GiB budget or backend assignment spec for graph-cut segmented param offload (0 = disabled, -1 = auto)
-    bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram)
-    bool eager_load;  // Load all params into the params backend at model-load time instead of lazily on first use
+    const char* max_vram;  // GiB budget or backend assignment spec for graph-cut segmented param offload (-1 = default auto, 0 = disabled)
+    bool stream_layers;    // Enable residency+prefetch streaming; the default automatic VRAM budget is used unless overridden
+    bool eager_load;       // Load all params into the params backend at model-load time instead of lazily on first use
     const char* backend;
     const char* params_backend;
     const char* split_mode;  // weight distribution for multi-device modules: layer (default) or row, or per-module assignments e.g. "diffusion=row"
@@ -244,8 +244,9 @@ typedef struct {
 } sd_layer_stream_params_t;
 
 enum sd_layer_stream_option_t {
-    SD_LAYER_STREAM_OPTION_NONE = 0,
-    SD_LAYER_STREAM_OPTION_POOL = 1u << 0,  // Reuse a fixed-slot VRAM pool for streamed parameters
+    SD_LAYER_STREAM_OPTION_NONE           = 0,
+    SD_LAYER_STREAM_OPTION_POOL           = 1u << 0,  // Reuse a fixed-slot VRAM pool for streamed parameters
+    SD_LAYER_STREAM_OPTION_NO_VRAM_SAFETY = 1u << 1,  // Disable the additional 512 MiB streaming pool margin
 };
 
 typedef struct {
@@ -444,6 +445,13 @@ typedef struct {
     bool circular_y;
 } sd_vid_gen_params_t;
 
+typedef struct {
+    const char* conditioning_input_path;
+    const char* conditioning_output_path;
+    const char* latent_input_path;
+    const char* latent_output_path;
+} sd_vid_gen_artifact_params_t;
+
 typedef struct sd_ctx_t sd_ctx_t;
 struct ggml_tensor;
 
@@ -460,6 +468,11 @@ SD_API int32_t sd_get_num_physical_cores();
 SD_API const char* sd_get_system_info();
 SD_API bool sd_ctx_supports_image_generation(const sd_ctx_t* sd_ctx);
 SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx);
+
+// Runtime attention sparsity changes are not safe while generation is in flight.
+// Supported models accept values in [0, 1); zero selects dense attention.
+SD_API bool sd_ctx_get_attention_sparsity(const sd_ctx_t* sd_ctx, float* sparsity);
+SD_API bool sd_ctx_set_attention_sparsity(sd_ctx_t* sd_ctx, float sparsity);
 
 // ControlNet hot-swap APIs are not safe to call while generation is in flight.
 SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path);
@@ -525,11 +538,25 @@ enum sd_cancel_mode_t {
 SD_API void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode);
 
 SD_API void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params);
+SD_API void sd_vid_gen_artifact_params_init(sd_vid_gen_artifact_params_t* artifact_params);
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            const sd_vid_gen_params_t* sd_vid_gen_params,
                            sd_image_t** frames_out,
                            int* num_frames_out,
                            sd_audio_t** audio_out);
+SD_API bool generate_video_with_artifacts(sd_ctx_t* sd_ctx,
+                                          const sd_vid_gen_params_t* sd_vid_gen_params,
+                                          const sd_vid_gen_artifact_params_t* artifact_params,
+                                          sd_image_t** frames_out,
+                                          int* num_frames_out,
+                                          sd_audio_t** audio_out);
+SD_API bool encode_video_conditioning(sd_ctx_t* sd_ctx,
+                                      const sd_vid_gen_params_t* sd_vid_gen_params,
+                                      const char* conditioning_output_path);
+SD_API bool sample_video_latent(sd_ctx_t* sd_ctx,
+                                const sd_vid_gen_params_t* sd_vid_gen_params,
+                                const char* conditioning_input_path,
+                                const char* latent_output_path);
 
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 

@@ -502,7 +502,7 @@ ArgOptions SDContextParams::get_options() {
          &rpc_servers},
         {"",
          "--max-vram",
-         "maximum VRAM budget in GiB for graph-cut segmented execution. Accepts a single value or assignments by backend/device, e.g. 6 or cuda0=6,vulkan0=4. 0 disables graph splitting; a negative value auto-detects free VRAM, sparing the specified value",
+         "maximum VRAM budget in GiB for graph-cut segmented execution. Accepts a single value or assignments by backend/device, e.g. 6 or cuda0=6,vulkan0=4. Defaults to -1 (automatic); 0 disables graph splitting; a negative value auto-detects free VRAM, sparing the specified value",
          0,
          &max_vram},
         {"",
@@ -522,12 +522,16 @@ ArgOptions SDContextParams::get_options() {
          "--layer-prefetch-depth",
          "number of future parameter-bearing graph-cut segments to prefetch with --stream-layers (default: 0; 0 disables prefetching, 1 overlaps the next segment, 2+ enables deeper lookahead when VRAM permits)",
          &layer_prefetch_depth},
+        {"",
+         "--stream-vram-safety",
+         "additional layer-stream pool safety margin in MiB (default: 512; accepts 512 or 0 to disable it)",
+         &stream_vram_safety},
     };
 
     options.bool_options = {
         {"",
          "--stream-layers",
-         "enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram; defaults to false)",
+         "enable residency+prefetch streaming with the automatic or explicitly configured VRAM budget (defaults to false)",
          true, &stream_layers},
         {"",
          "--stream-layer-pool",
@@ -794,6 +798,10 @@ bool SDContextParams::validate(SDMode mode) {
         LOG_ERROR("error: --layer-prefetch-depth must be >= 0");
         return false;
     }
+    if (stream_vram_safety != 0 && stream_vram_safety != 512) {
+        LOG_ERROR("error: --stream-vram-safety must be 512 or 0");
+        return false;
+    }
 
     return true;
 }
@@ -874,6 +882,7 @@ std::string SDContextParams::to_string() const {
         << "  stream_layers: " << (stream_layers ? "true" : "false") << ",\n"
         << "  resident_layers: " << resident_layers << ",\n"
         << "  layer_prefetch_depth: " << layer_prefetch_depth << ",\n"
+        << "  stream_vram_safety: " << stream_vram_safety << ",\n"
         << "  stream_layer_pool: " << (stream_layer_pool ? "true" : "false") << ",\n"
         << "  eager_load: " << (eager_load ? "true" : "false") << ",\n"
         << "  backend: \"" << backend << "\",\n"

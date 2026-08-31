@@ -1,7 +1,9 @@
 #ifndef __MODEL_MANAGER_H__
 #define __MODEL_MANAGER_H__
 
+#include <atomic>
 #include <cstdint>
+#include <future>
 #include <map>
 #include <memory>
 #include <set>
@@ -110,6 +112,9 @@ private:
         ggml_backend_buffer_t buffer    = nullptr;
         std::vector<std::pair<TensorState*, ggml_tensor*>> staged_tensors;
         std::shared_ptr<StreamingPoolSlot> pool_slot;
+        std::future<bool> disk_load_future;
+        DirectStorageLoadStats disk_load_stats;
+        bool disk_load_used_direct = false;
     };
 
     ModelLoader model_loader_;
@@ -122,6 +127,8 @@ private:
     std::map<ggml_backend_t, ggml_backend_t> prefetch_backends_;
     std::map<uintptr_t, StreamingPoolConfig> streaming_pool_configs_;
     bool warned_split_lora_skip_ = false;
+    std::atomic<bool> direct_storage_failed_{false};
+    std::atomic<bool> direct_storage_fallback_warned_{false};
     std::set<std::string> common_ignore_tensors_;
     std::vector<LoraSpec> loras_;
     SDVersion lora_version_      = VERSION_COUNT;
@@ -134,8 +141,9 @@ private:
     void release_all();
 
     ParamPrefetchResult populate_prefetch_block(PrefetchBlock& block);
+    bool load_disk_prefetch_block(PrefetchBlock& block);
     ggml_backend_t prefetch_backend_for(ggml_backend_t compute_backend);
-    void synchronize_prefetch_block(PrefetchBlock& block);
+    bool synchronize_prefetch_block(PrefetchBlock& block);
     void free_prefetch_block(PrefetchBlock& block);
     void clear_all_param_prefetches();
     ParamPrefetchResult acquire_streaming_pool_slot(
@@ -243,6 +251,7 @@ public:
 
     bool validate_registered_tensors();
     bool load_all_params_eagerly();
+    void prepare_direct_storage();
 
     bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
                                 ggml_backend_t compute_backend) override;

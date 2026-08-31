@@ -1032,7 +1032,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
         }
     }
     if (scale != 1.f) {
-        x = ggml_ext_scale(ctx, x, 1.f / scale);
+        x = ggml_ext_scale(ctx, x, 1.f / scale, true);
     }
     if (b != nullptr) {
         x = ggml_add_inplace(ctx, x, b);
@@ -1064,7 +1064,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear_i8_tensorwise(ggml_context* ctx,
     }
 
     if (scale != 1.f) {
-        x = ggml_ext_scale(ctx, x, 1.f / scale);
+        x = ggml_ext_scale(ctx, x, 1.f / scale, true);
         if (b != nullptr) {
             x = ggml_add_inplace(ctx, x, b);
         }
@@ -1356,14 +1356,28 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       ggml_tensor* mask = nullptr,
                                                       bool skip_reshape = false,
                                                       bool flash_attn   = false,
-                                                      float kv_scale    = 1.0f) {  // avoid overflow
+                                                      float kv_scale    = 1.0f,  // avoid overflow
+                                                      float sparsity    = 0.0f,
+                                                      bool kv_prepared  = false) {
     int64_t L_q;
     int64_t L_k;
     int64_t C;
     int64_t N;
     int64_t d_head;
     int64_t n_kv_head;
-    if (!skip_reshape) {
+    if (kv_prepared) {
+        GGML_ASSERT(skip_reshape);
+        L_q       = q->ne[1];
+        L_k       = k->ne[1];
+        d_head    = v->ne[0];
+        N         = q->ne[3];
+        n_kv_head = k->ne[2];
+        C         = d_head * n_head;
+        GGML_ASSERT(q->ne[0] == d_head && k->ne[0] == d_head);
+        GGML_ASSERT(q->ne[2] == n_head && q->ne[3] == k->ne[3]);
+        GGML_ASSERT(k->ne[2] == v->ne[2] && k->ne[3] == v->ne[3]);
+        GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    } else if (!skip_reshape) {
         L_q       = q->ne[1];
         L_k       = k->ne[1];
         C         = q->ne[0];
@@ -1394,17 +1408,19 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     ggml_tensor* kqv = nullptr;
 
     auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
-        if (kv_scale != 1.0f) {
-            k_in = ggml_ext_scale(ctx, k_in, kv_scale);
-        }
-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        if (!kv_prepared) {
+            if (kv_scale != 1.0f) {
+                k_in = ggml_ext_scale(ctx, k_in, kv_scale);
+            }
+            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
 
-        v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
-        v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
-        if (kv_scale != 1.0f) {
-            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
+            v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
+            v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
+            if (kv_scale != 1.0f) {
+                v_in = ggml_ext_scale(ctx, v_in, kv_scale);
+            }
+            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
         }
-        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
 
         if (mask_in != nullptr) {
             // ggml_flash_attn_ext expects the mask as a contiguous F16 tensor shaped
@@ -1423,12 +1439,22 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         }
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
+        if (sparsity > 0.0f) {
+            memcpy((float *) out->op_params + 4, &sparsity, sizeof(sparsity));
+        }
         if (!ggml_backend_supports_op(backend, out)) {
-            return nullptr;
+            if (sparsity <= 0.0f) {
+                return nullptr;
+            }
+            const float dense = 0.0f;
+            memcpy((float *) out->op_params + 4, &dense, sizeof(dense));
+            if (!ggml_backend_supports_op(backend, out)) {
+                return nullptr;
+            }
         }
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         if (kv_scale != 1.0f) {
-            out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
+            out = ggml_ext_scale(ctx, out, 1.0f / kv_scale, true);
         }
         return out;
     };
@@ -1462,7 +1488,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         // if (flash_attn) {
         //     LOG_DEBUG("fallback to default attention, L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
         // }
-        v = ggml_ext_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
+        if (kv_prepared && kv_scale != 1.0f) {
+            k = ggml_ext_scale(ctx, k, 1.0f / kv_scale);
+            v = ggml_ext_scale(ctx, v, 1.0f / kv_scale);
+        }
+        v = ggml_ext_cont(ctx,
+                          kv_prepared ? ggml_permute(ctx, v, 1, 0, 2, 3)
+                                      : ggml_permute(ctx, v, 1, 2, 0, 3));  // [N, n_kv_head, d_head, L_k]
         v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);   // [N * n_kv_head, d_head, L_k]
 
         auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
@@ -1690,6 +1722,8 @@ struct WeightAdapter {
         struct {
             bool force_prec_f32 = false;
             float scale         = 1.f;
+            int64_t output_start = 0;
+            int64_t output_end   = -1;
         } linear;
         struct conv2d_params_t {
             int s0          = 1;
@@ -1719,6 +1753,10 @@ struct WeightAdapter {
                                             ggml_tensor* output,
                                             const std::string& prefix,
                                             ForwardParams forward_params)                                                             = 0;
+    virtual bool supports_linear_output_slice(const std::string& prefix,
+                                              int64_t output_start,
+                                              int64_t output_end,
+                                              int64_t full_output_size) const                                                          = 0;
     virtual size_t get_extra_graph_size()                                                                                             = 0;
 };
 
@@ -1777,6 +1815,11 @@ protected:
     using GraphCutSegment = sd::ggml_graph_cut::Segment;
     using GraphCutPlan    = sd::ggml_graph_cut::Plan;
 
+    enum class CrossForwardPrefetch {
+        ENABLED,
+        DISABLED,
+    };
+
     ggml_backend_t runtime_backend = nullptr;
 
     ggml_context* params_ctx = nullptr;
@@ -1793,6 +1836,7 @@ protected:
     bool stream_layer_pool_enabled        = false;
     int resident_segment_limit            = -1;
     int segment_prefetch_depth            = 0;
+    size_t stream_vram_safety_margin_bytes = sd::ggml_graph_cut::STREAMING_VRAM_SAFETY_MARGIN;
     size_t runtime_resident_segment_cap   = SIZE_MAX;
     size_t runtime_prefetch_depth_cap     = SIZE_MAX;
     size_t runtime_pool_slot_cap          = SIZE_MAX;
@@ -1916,13 +1960,19 @@ protected:
     }
 
     void alloc_compute_ctx() {
+        const size_t tensor_capacity = get_compute_context_tensor_capacity();
         ggml_init_params params;
-        params.mem_size   = static_cast<size_t>(ggml_tensor_overhead() * MAX_GRAPH_SIZE + ggml_graph_overhead());
+        params.mem_size   = ggml_tensor_overhead() * tensor_capacity +
+                          ggml_graph_overhead_custom(tensor_capacity, false);
         params.mem_buffer = nullptr;
         params.no_alloc   = true;
 
         compute_ctx = ggml_init(params);
         GGML_ASSERT(compute_ctx != nullptr);
+    }
+
+    virtual size_t get_compute_context_tensor_capacity() const {
+        return MAX_GRAPH_SIZE;
     }
 
     void free_compute_ctx() {
@@ -2310,18 +2360,63 @@ protected:
         alloc_cache_ctx();
         std::vector<std::pair<ggml_tensor*, ggml_tensor*>> source_to_cache_tensors;
         source_to_cache_tensors.reserve(merged_cache_sources.size());
+        std::unordered_map<const ggml_tensor*, std::vector<uint8_t>> staged_old_sources;
+        size_t retained_old_bytes = 0;
         for (const auto& kv : merged_cache_sources) {
             ggml_tensor* source_tensor = sd::ggml_graph_cut::cache_source_tensor(kv.second);
             auto cache_tensor          = ggml_dup_tensor(cache_ctx, source_tensor);
             ggml_set_name(cache_tensor, kv.first.c_str());
             source_to_cache_tensors.push_back({source_tensor, cache_tensor});
+            if (old_cache_buffer != nullptr &&
+                sd::ggml_graph_cut::tensor_buffer(source_tensor) == old_cache_buffer) {
+                retained_old_bytes += ggml_nbytes(source_tensor);
+            }
+        }
+        const size_t old_cache_size = old_cache_buffer == nullptr
+                                          ? 0
+                                          : ggml_backend_buffer_get_size(old_cache_buffer);
+        const bool compact_old_cache = old_cache_buffer != nullptr &&
+                                       old_cache_size > retained_old_bytes + 256ull * 1024ull * 1024ull;
+        if (compact_old_cache) {
+            for (const auto& kv : source_to_cache_tensors) {
+                ggml_tensor* src = kv.first;
+                if (sd::ggml_graph_cut::tensor_buffer(src) != old_cache_buffer) {
+                    continue;
+                }
+                auto& host_data = staged_old_sources[src];
+                host_data.resize(ggml_nbytes(src));
+                ggml_backend_tensor_get(src, host_data.data(), 0, host_data.size());
+            }
+            LOG_DEBUG("%s compacting expired graph-cut cache: old=%.2f MB retained=%.2f MB",
+                      get_desc().c_str(),
+                      old_cache_size / (1024.f * 1024.f),
+                      retained_old_bytes / (1024.f * 1024.f));
+            ggml_backend_buffer_free(old_cache_buffer);
+            old_cache_buffer = nullptr;
+            if (old_cache_ctx != nullptr) {
+                ggml_free(old_cache_ctx);
+            }
+            old_cache_ctx = nullptr;
         }
         size_t num_tensors = ggml_tensor_num(cache_ctx);
         cache_buffer       = ggml_backend_alloc_ctx_tensors(cache_ctx, runtime_backend);
         GGML_ASSERT(cache_buffer != nullptr);
+        LOG_DEBUG("%s cache backend buffer allocated: buffer=%p name=%s old=%p",
+                  get_desc().c_str(),
+                  (void*) cache_buffer,
+                  ggml_backend_buffer_name(cache_buffer),
+                  (void*) old_cache_buffer);
         for (const auto& kv : source_to_cache_tensors) {
             ggml_tensor* src              = kv.first;
             ggml_tensor* dst              = kv.second;
+            auto staged_it = staged_old_sources.find(src);
+            if (staged_it != staged_old_sources.end()) {
+                ggml_backend_tensor_set(dst,
+                                        staged_it->second.data(),
+                                        0,
+                                        staged_it->second.size());
+                continue;
+            }
             ggml_backend_buffer_t src_buf = sd::ggml_graph_cut::tensor_buffer(src);
             ggml_backend_buffer_t dst_buf = sd::ggml_graph_cut::tensor_buffer(dst);
             if (src_buf == nullptr || dst_buf == nullptr) {
@@ -2495,7 +2590,8 @@ protected:
                                                       effective_resident_limit,
                                                       effective_prefetch_depth,
                                                       stream_layer_pool_enabled,
-                                                      runtime_pool_slot_cap);
+                                                      runtime_pool_slot_cap,
+                                                      stream_vram_safety_margin_bytes);
     }
 
     bool resolve_graph_cut_plan(ggml_cgraph* gf,
@@ -2526,9 +2622,9 @@ protected:
                 if (total_vram > 0) {
                     reclaimable_free = std::min(reclaimable_free, total_vram);
                 }
-                free_clamp = reclaimable_free > sd::ggml_graph_cut::STREAMING_VRAM_SAFETY_MARGIN
-                                 ? reclaimable_free - sd::ggml_graph_cut::STREAMING_VRAM_SAFETY_MARGIN
-                                 : 0;
+                // annotate_residency() accounts for the configured streaming
+                // safety margin when sizing the pool and prefetch policy.
+                free_clamp = reclaimable_free;
                 if (free_clamp < effective_budget) {
                     LOG_DEBUG(
                         "%s clamping streaming budget: free VRAM %.2f MB + runner-owned %.2f MB < user cap %.2f MB",
@@ -2790,6 +2886,7 @@ protected:
     struct SegmentStreamParams {
         std::vector<std::vector<ggml_tensor*>> all_by_segment;
         std::vector<std::vector<ggml_tensor*>> prefetch_by_segment;
+        std::vector<ggml_tensor*> shared_params;
         std::vector<size_t> param_segments;
         std::vector<size_t> segment_to_param_position;
         bool has_prefetch_params = false;
@@ -2829,24 +2926,27 @@ protected:
             return stream_params;
         }
 
-        const size_t shared_params = static_cast<size_t>(std::count_if(
+        const size_t shared_param_count = static_cast<size_t>(std::count_if(
             segment_occurrences.begin(),
             segment_occurrences.end(),
             [](const auto& occurrence) { return occurrence.second > 1; }));
+        std::unordered_set<ggml_tensor*> recorded_shared_params;
         for (size_t segment_index : stream_params.param_segments) {
             auto& prefetch_params = stream_params.prefetch_by_segment[segment_index];
             for (ggml_tensor* tensor : stream_params.all_by_segment[segment_index]) {
                 if (segment_occurrences.at(tensor) == 1) {
                     prefetch_params.push_back(tensor);
+                } else if (recorded_shared_params.insert(tensor).second) {
+                    stream_params.shared_params.push_back(tensor);
                 }
             }
             stream_params.has_prefetch_params =
                 stream_params.has_prefetch_params || !prefetch_params.empty();
         }
-        if (shared_params > 0 && !stream_shared_params_logged) {
-            LOG_INFO("%s segment prefetch excludes %zu cross-segment parameters from asynchronous transfers",
+        if (shared_param_count > 0 && !stream_shared_params_logged) {
+            LOG_INFO("%s layer stream keeps %zu cross-segment parameters resident across segments",
                      get_desc().c_str(),
-                     shared_params);
+                     shared_param_count);
             stream_shared_params_logged = true;
         }
         return stream_params;
@@ -3132,10 +3232,47 @@ protected:
             node->data   = nullptr;
             node->extra  = nullptr;
         }
+
+        if (compute_ctx != nullptr) {
+            for (ggml_tensor* tensor = ggml_get_first_tensor(compute_ctx);
+                 tensor != nullptr;
+                 tensor = ggml_get_next_tensor(compute_ctx, tensor)) {
+                if (tensor->view_src == nullptr) {
+                    continue;
+                }
+                tensor->buffer = nullptr;
+                tensor->data   = nullptr;
+                tensor->extra  = nullptr;
+            }
+        }
     }
 
     bool bind_segment_cached_inputs(ggml_cgraph* gf, const GraphCutSegment& segment) {
         GGML_ASSERT(gf != nullptr);
+        auto reset_dependent_views = [&](ggml_tensor* root) {
+            auto reset_if_dependent = [&](ggml_tensor* tensor) {
+                if (tensor == nullptr || tensor == root || tensor->view_src == nullptr) {
+                    return;
+                }
+                for (ggml_tensor* source = tensor->view_src;
+                     source != nullptr;
+                     source = source->view_src) {
+                    if (source == root) {
+                        tensor->buffer = nullptr;
+                        tensor->data   = nullptr;
+                        tensor->extra  = nullptr;
+                        return;
+                    }
+                }
+            };
+            for (int node_idx = 0; node_idx < ggml_graph_n_nodes(gf); ++node_idx) {
+                reset_if_dependent(ggml_graph_node(gf, node_idx));
+            }
+            const int leaf_count = sd::ggml_graph_cut::leaf_count(gf);
+            for (int leaf_idx = 0; leaf_idx < leaf_count; ++leaf_idx) {
+                reset_if_dependent(sd::ggml_graph_cut::leaf_tensor(gf, leaf_idx));
+            }
+        };
         for (const auto& input : segment.input_refs) {
             ggml_tensor* input_tensor = sd::ggml_graph_cut::input_tensor(gf, input);
             if (input_tensor == nullptr) {
@@ -3150,22 +3287,54 @@ protected:
                                   input.display_name.c_str());
                         return false;
                     }
+                    if (input.display_name.find("rotary_embeddings") != std::string::npos) {
+                        LOG_DEBUG("%s binding cached rotary input: tensor=%p cache=%p cache-buffer=%p member-buffer=%p buffer-name=%s",
+                                  get_desc().c_str(),
+                                  (void*) input_tensor,
+                                  (void*) cache_tensor,
+                                  (void*) cache_tensor->buffer,
+                                  (void*) cache_buffer,
+                                  cache_tensor->buffer != nullptr
+                                      ? ggml_backend_buffer_name(cache_tensor->buffer)
+                                      : "null");
+                    }
                     if (input_tensor->view_src != nullptr) {
-                        input_tensor->view_src = cache_tensor;
-                        input_tensor->buffer   = nullptr;
-                        input_tensor->data     = cache_tensor->data == nullptr
-                                                     ? nullptr
-                                                     : static_cast<void*>(static_cast<char*>(cache_tensor->data) + input_tensor->view_offs);
-                        input_tensor->extra    = cache_tensor->extra;
+                        ggml_tensor* original_view_source = input_tensor->view_src;
+                        auto rebind_view = [&](ggml_tensor* tensor) {
+                            if (tensor == nullptr || tensor->view_src != original_view_source) {
+                                return;
+                            }
+                            tensor->view_src = cache_tensor;
+                            tensor->buffer   = nullptr;
+                            tensor->data     = cache_tensor->data == nullptr
+                                                   ? nullptr
+                                                   : static_cast<void*>(static_cast<char*>(cache_tensor->data) + tensor->view_offs);
+                            tensor->extra    = cache_tensor->extra;
+                        };
+                        if (compute_ctx != nullptr) {
+                            for (ggml_tensor* tensor = ggml_get_first_tensor(compute_ctx);
+                                 tensor != nullptr;
+                                 tensor = ggml_get_next_tensor(compute_ctx, tensor)) {
+                                rebind_view(tensor);
+                            }
+                        }
+                        rebind_view(input_tensor);
                     } else {
                         input_tensor->buffer = cache_tensor->buffer;
                         input_tensor->data   = cache_tensor->data;
                         input_tensor->extra  = cache_tensor->extra;
+                        if (!sd_backend_alias_tensor(runtime_backend, cache_tensor, input_tensor)) {
+                            LOG_ERROR("%s failed to bind graph cut cache tensor: %s",
+                                      get_desc().c_str(),
+                                      input.display_name.c_str());
+                            return false;
+                        }
                     }
                     for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                         input_tensor->src[src_idx] = nullptr;
                     }
                     input_tensor->op = GGML_OP_NONE;
+                    reset_dependent_views(input_tensor);
                     break;
                 }
                 case GraphCutSegment::INPUT_EXTERNAL:
@@ -3184,7 +3353,11 @@ protected:
                                                bool preserve_backend_tensor_data_map,
                                                bool no_return                                          = false,
                                                const std::unordered_set<std::string>* cache_keep_names = nullptr,
-                                               const std::function<void()>& before_compute             = {}) {
+                                               const std::function<void()>& before_compute             = {},
+                                               double* compute_seconds                                 = nullptr) {
+        if (compute_seconds != nullptr) {
+            *compute_seconds = 0.0;
+        }
         std::vector<ggml_tensor*> graph_param_tensors;
         std::vector<ggml_tensor*> params_to_prepare;
         if (!prepare_execute_graph_weights(gf, graph_param_tensors, params_to_prepare, !free_compute_params)) {
@@ -3202,6 +3375,7 @@ protected:
             ~GraphWeightDoneGuard() {
                 if (enabled && runner != nullptr && tensors != nullptr) {
                     runner->free_compute_backend_param_tensors(*tensors);
+                    runner->free_params_backend_param_tensors(*tensors);
                 }
             }
 
@@ -3258,6 +3432,7 @@ protected:
             sd_backend_cpu_set_n_threads(cpu_fallback_backend, n_threads);
         }
 
+        const int64_t compute_start_us = ggml_time_us();
         ggml_status status;
         if (sched != nullptr) {
             if (sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
@@ -3274,6 +3449,9 @@ protected:
                                                                  gf,
                                                                  sd_get_backend_eval_callback(),
                                                                  sd_get_backend_eval_callback_data());
+        }
+        if (compute_seconds != nullptr) {
+            *compute_seconds = (ggml_time_us() - compute_start_us) / 1000000.0;
         }
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
@@ -3351,9 +3529,11 @@ protected:
                                                             int n_threads,
                                                             bool log_residency,
                                                             bool no_return,
+                                                            bool prefetch_next_forward,
                                                             size_t effective_budget,
                                                             sd::ggml_graph_cut::StreamingPolicy streaming_policy) {
         GGML_ASSERT(gf != nullptr);
+        const int64_t segmented_start_us = ggml_time_us();
 
         free_compute_buffer();
         free_cache_ctx_and_buffer();
@@ -3457,8 +3637,20 @@ protected:
                 streaming_policy.pool_slot_bytes / (1024.0 * 1024.0));
             stream_policy_logged = true;
         }
+        if (stream_layers_enabled && pool_active) {
+            LOG_DEBUG(
+                "%s layer stream pool budget: effective=%.2f MB safety=%.2f MB non-slot=%.2f MB available-slots=%.2f MB",
+                get_desc().c_str(),
+                effective_budget / (1024.0 * 1024.0),
+                streaming_policy.safety_margin_bytes / (1024.0 * 1024.0),
+                streaming_policy.pool_base_non_slot_bytes / (1024.0 * 1024.0),
+                streaming_policy.pool_available_bytes / (1024.0 * 1024.0));
+        }
         if (stream_layers_enabled && !kept_compute_param_tensor_set.empty()) {
             std::unordered_set<const ggml_tensor*> desired_resident_params;
+            for (ggml_tensor* tensor : stream_params.shared_params) {
+                desired_resident_params.insert(tensor);
+            }
             for (size_t segment_index = 0; segment_index < plan.segments.size(); ++segment_index) {
                 if (plan.segments[segment_index].residency !=
                     sd::ggml_graph_cut::SegmentResidency::RESIDENT) {
@@ -3489,6 +3681,24 @@ protected:
                 for (ggml_tensor* tensor : params_to_release) {
                     kept_compute_param_tensor_set.erase(tensor);
                 }
+            }
+        }
+        if (stream_layers_enabled && !stream_params.shared_params.empty()) {
+            std::vector<ggml_tensor*> shared_params_to_prepare;
+            for (ggml_tensor* tensor : stream_params.shared_params) {
+                if (kept_compute_param_tensor_set.count(tensor) == 0) {
+                    shared_params_to_prepare.push_back(tensor);
+                }
+            }
+            if (!shared_params_to_prepare.empty()) {
+                if (manager == nullptr || !manager->prepare_params(shared_params_to_prepare)) {
+                    LOG_ERROR("%s failed to prepare cross-segment streaming parameters",
+                              get_desc().c_str());
+                    free_compute_ctx();
+                    return std::nullopt;
+                }
+                kept_compute_param_tensor_set.insert(shared_params_to_prepare.begin(),
+                                                     shared_params_to_prepare.end());
             }
         }
         bool async_prefetch_active    = prefetch_requested &&
@@ -3548,10 +3758,15 @@ protected:
         };
 
         std::optional<sd::Tensor<T>> output = sd::Tensor<T>();
+        LOG_DEBUG("%s segmented setup completed in %.6fs",
+                  get_desc().c_str(),
+                  (ggml_time_us() - segmented_start_us) / 1000000.0);
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); ++seg_idx) {
-            const auto& segment   = plan.segments[seg_idx];
-            const bool is_last    = seg_idx + 1 == plan.segments.size();
-            size_t param_position = SIZE_MAX;
+            const int64_t segment_start_us = ggml_time_us();
+            double load_wait_seconds       = 0.0;
+            const auto& segment            = plan.segments[seg_idx];
+            const bool is_last             = seg_idx + 1 == plan.segments.size();
+            size_t param_position          = SIZE_MAX;
             if (!stream_params.segment_to_param_position.empty()) {
                 param_position = stream_params.segment_to_param_position[seg_idx];
             }
@@ -3569,7 +3784,13 @@ protected:
                     return result == ParamPrefetchResult::SUCCESS &&
                            activate_segment_prefetch(seg_idx, stream_params);
                 };
-                if (!activate_current_segment()) {
+                auto timed_activate_current_segment = [&]() {
+                    const int64_t activate_start_us = ggml_time_us();
+                    const bool activated            = activate_current_segment();
+                    load_wait_seconds += (ggml_time_us() - activate_start_us) / 1000000.0;
+                    return activated;
+                };
+                if (!timed_activate_current_segment()) {
                     if (!pool_active) {
                         disable_async_prefetch("activating a segment");
                     } else {
@@ -3578,7 +3799,7 @@ protected:
                         } else {
                             clear_stream_prefetch_state();
                         }
-                        if (!activate_current_segment()) {
+                        if (!timed_activate_current_segment()) {
                             LOG_ERROR(
                                 "%s failed to stage the current segment in the mandatory streaming pool",
                                 get_desc().c_str());
@@ -3637,6 +3858,7 @@ protected:
                                   &runtime_prefetch_depth,
                                   &async_prefetch_active,
                                   &residency_changed,
+                                  prefetch_next_forward,
                                   &disable_async_prefetch]() {
                     if (!async_prefetch_active) {
                         return;
@@ -3645,7 +3867,7 @@ protected:
                         param_position,
                         stream_params,
                         runtime_prefetch_depth,
-                        stream_next_forward_prefetch,
+                        prefetch_next_forward,
                         plan,
                         residency_changed);
                     if (result.result == ParamPrefetchResult::SUCCESS) {
@@ -3666,15 +3888,26 @@ protected:
                     disable_async_prefetch("queueing future segments");
                 };
             }
-            auto segment_output = execute_graph<T>(segment_graph,
-                                                   n_threads,
-                                                   true,
-                                                   !keep_segment_params,
-                                                   true,
-                                                   !is_last || no_return,
-                                                   &future_cut_names,
-                                                   before_compute);
+            double inference_seconds = 0.0;
+            auto segment_output      = execute_graph<T>(segment_graph,
+                                                        n_threads,
+                                                        !reuse_compute_buffer_between_segments(),
+                                                        !keep_segment_params,
+                                                        true,
+                                                        !is_last || no_return,
+                                                        &future_cut_names,
+                                                        before_compute,
+                                                        &inference_seconds);
             ggml_free(segment_graph_ctx);
+            LOG_DEBUG(
+                "%s layer stream timing: segment=%zu/%zu name=%s load-wait=%.6fs inference=%.6fs total=%.6fs",
+                get_desc().c_str(),
+                seg_idx + 1,
+                plan.segments.size(),
+                segment.group_name.c_str(),
+                load_wait_seconds,
+                inference_seconds,
+                (ggml_time_us() - segment_start_us) / 1000000.0);
             if (residency_changed) {
                 release_unretained_resident_params(plan, stream_params);
                 residency_changed = false;
@@ -3688,15 +3921,21 @@ protected:
             output = std::move(segment_output);
         }
 
+        const int64_t cleanup_start_us = ggml_time_us();
         backend_tensor_data_map.clear();
         free_cache_ctx_and_buffer();
         free_compute_ctx();
         prefetch_cleanup.keep = async_prefetch_active;
+        LOG_DEBUG("%s segmented cleanup=%.6fs total=%.6fs",
+                  get_desc().c_str(),
+                  (ggml_time_us() - cleanup_start_us) / 1000000.0,
+                  (ggml_time_us() - segmented_start_us) / 1000000.0);
         return output;
     }
 
 public:
     void runner_done() {
+        const int64_t runner_done_start_us = ggml_time_us();
         stream_residency_enabled       = false;
         runtime_resident_segment_cap   = SIZE_MAX;
         runtime_prefetch_depth_cap     = SIZE_MAX;
@@ -3706,19 +3945,38 @@ public:
         stream_prefetch_runtime_warned = false;
         stream_prefetch_reduced_warned = false;
         stream_pool_budget_warned      = false;
+        const int64_t state_reset_us   = ggml_time_us();
         free_compute_buffer();
+        const int64_t compute_freed_us = ggml_time_us();
         clear_stream_prefetch_state();
+        const int64_t prefetch_freed_us = ggml_time_us();
         std::vector<ggml_tensor*> tensors_to_release = std::move(this->runner_param_tensors);
         this->runner_param_tensors.clear();
         runner_param_tensor_set.clear();
         kept_compute_param_tensor_set.clear();
         free_compute_backend_param_tensors(tensors_to_release);
+        const int64_t compute_params_freed_us = ggml_time_us();
         free_params_backend_param_tensors(tensors_to_release);
+        const int64_t params_freed_us = ggml_time_us();
         clear_stream_pool_state();
+        const int64_t pool_freed_us = ggml_time_us();
+        LOG_DEBUG("%s runner teardown: state=%.6fs compute=%.6fs prefetch=%.6fs compute-params=%.6fs params=%.6fs pool=%.6fs total=%.6fs",
+                  get_desc().c_str(),
+                  (state_reset_us - runner_done_start_us) / 1000000.0,
+                  (compute_freed_us - state_reset_us) / 1000000.0,
+                  (prefetch_freed_us - compute_freed_us) / 1000000.0,
+                  (compute_params_freed_us - prefetch_freed_us) / 1000000.0,
+                  (params_freed_us - compute_params_freed_us) / 1000000.0,
+                  (pool_freed_us - params_freed_us) / 1000000.0,
+                  (pool_freed_us - runner_done_start_us) / 1000000.0);
     }
 
 public:
     virtual std::string get_desc() = 0;
+
+    virtual bool reuse_compute_buffer_between_segments() const {
+        return false;
+    }
 
     GGMLRunner(ggml_backend_t backend,
                std::shared_ptr<RunnerWeightManager> manager = nullptr)
@@ -3855,7 +4113,8 @@ public:
                                          bool auto_free           = true,
                                          bool free_compute_buffer = true,
                                          bool free_compute_params = true,
-                                         bool no_return           = false) {
+                                         bool no_return           = false,
+                                         CrossForwardPrefetch cross_forward_prefetch = CrossForwardPrefetch::ENABLED) {
         struct RunnerDoneGuard {
             RunnerDoneGuard(GGMLRunner* runner, bool enabled)
                 : runner(runner),
@@ -3875,17 +4134,21 @@ public:
         };
         RunnerDoneGuard runner_done_guard(this, auto_free);
 
+        const int64_t runner_compute_start_us = ggml_time_us();
         ggml_cgraph* gf = nullptr;
         if (!prepare_compute_graph(get_graph, &gf)) {
             return std::nullopt;
         }
+        const int64_t graph_prepared_us = ggml_time_us();
         GGML_ASSERT(gf != nullptr);
         rebuild_params_tensor_set();
+        const int64_t params_rebuilt_us = ggml_time_us();
 
         if (!assign_graph_cut_layer_split_backends(gf)) {
             free_compute_ctx();
             return std::nullopt;
         }
+        const int64_t backends_assigned_us = ggml_time_us();
 
         if (can_attempt_graph_cut_segmented_compute()) {
             GraphCutPlan plan;
@@ -3898,14 +4161,27 @@ public:
                 free_compute_ctx();
                 return std::nullopt;
             }
+            const int64_t plan_resolved_us = ggml_time_us();
+            LOG_DEBUG("%s runner setup: graph=%.6fs params=%.6fs assign=%.6fs plan=%.6fs",
+                      get_desc().c_str(),
+                      (graph_prepared_us - runner_compute_start_us) / 1000000.0,
+                      (params_rebuilt_us - graph_prepared_us) / 1000000.0,
+                      (backends_assigned_us - params_rebuilt_us) / 1000000.0,
+                      (plan_resolved_us - backends_assigned_us) / 1000000.0);
             if (should_use_graph_cut_segmented_compute(plan)) {
-                return compute_graph_cut_segments<T>(gf,
-                                                     plan,
-                                                     n_threads,
-                                                     stream_layers_enabled,
-                                                     no_return,
-                                                     effective_budget,
-                                                     streaming_policy);
+                auto result = compute_graph_cut_segments<T>(gf,
+                                                            plan,
+                                                            n_threads,
+                                                            stream_layers_enabled,
+                                                            no_return,
+                                                            stream_next_forward_prefetch &&
+                                                                cross_forward_prefetch == CrossForwardPrefetch::ENABLED,
+                                                            effective_budget,
+                                                            streaming_policy);
+                LOG_DEBUG("%s runner compute total=%.6fs",
+                          get_desc().c_str(),
+                          (ggml_time_us() - runner_compute_start_us) / 1000000.0);
+                return result;
             }
             if (stream_layers_enabled && stream_layer_pool_enabled) {
                 LOG_ERROR(
@@ -3998,6 +4274,17 @@ public:
         stream_pool_budget_warned        = false;
         stream_policy_logged             = false;
         stream_limits_unavailable_warned = false;
+    }
+
+    void set_stream_vram_safety_margin_bytes(size_t bytes) {
+        if (stream_vram_safety_margin_bytes == bytes) {
+            return;
+        }
+        stream_vram_safety_margin_bytes = bytes;
+        runtime_resident_segment_cap    = SIZE_MAX;
+        runtime_prefetch_depth_cap      = SIZE_MAX;
+        runtime_pool_slot_cap           = SIZE_MAX;
+        stream_policy_logged            = false;
     }
 
     void set_stream_residency_enabled(bool enabled) {
@@ -4188,6 +4475,81 @@ protected:
     float scale;
     std::string prefix;
 
+    ggml_tensor* forward_impl(GGMLRunnerContext* ctx,
+                              ggml_tensor* x,
+                              ggml_tensor* w,
+                              ggml_tensor* b,
+                              ggml_tensor* weight_scale,
+                              int64_t output_start,
+                              int64_t output_end) {
+        WeightAdapter::ForwardParams forward_params;
+        forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
+        forward_params.linear.force_prec_f32 = force_prec_f32;
+        forward_params.linear.scale          = scale;
+        forward_params.linear.output_start   = output_start;
+        forward_params.linear.output_end     = output_end;
+
+        ggml_tensor* linear_bias = weight_scale != nullptr ? nullptr : b;
+        ggml_tensor* out         = nullptr;
+        if (w->type == GGML_TYPE_I8) {
+            if (x->type != GGML_TYPE_F32) {
+                x = ggml_ext_cast_f32(ctx->ggml_ctx, ctx->backend, x);
+            }
+            if (!ggml_is_contiguous(x)) {
+                x = ggml_cont(ctx->ggml_ctx, x);
+            }
+            ggml_tensor* lora_input = x;
+            if (ctx->weight_adapter && b != nullptr) {
+                b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
+            }
+            if (int8_convrot && scale == 1.f) {
+                const auto cache_key = std::make_pair(x, int8_convrot_group_size);
+                auto cached          = ctx->int8_convrot_cache.find(cache_key);
+                if (cached == ctx->int8_convrot_cache.end()) {
+                    x = ggml_quantize_i8_convrot(ctx->ggml_ctx, x, int8_convrot_group_size);
+                    ctx->int8_convrot_cache.emplace(cache_key, x);
+                } else {
+                    x = cached->second;
+                }
+            }
+            out = ggml_ext_linear_i8_tensorwise(ctx->ggml_ctx,
+                                                x,
+                                                w,
+                                                weight_scale,
+                                                b,
+                                                int8_convrot ? int8_convrot_group_size : 0,
+                                                scale);
+            if (ctx->weight_adapter) {
+                out = ctx->weight_adapter->add_lora_to_output(ctx->ggml_ctx,
+                                                              ctx->backend,
+                                                              lora_input,
+                                                              w,
+                                                              out,
+                                                              prefix,
+                                                              forward_params);
+            }
+            return out;
+        }
+        if (ctx->weight_adapter) {
+            out = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx,
+                                                         ctx->backend,
+                                                         x,
+                                                         w,
+                                                         linear_bias,
+                                                         prefix,
+                                                         forward_params);
+        } else {
+            out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
+        }
+        if (weight_scale != nullptr) {
+            out = ggml_mul(ctx->ggml_ctx, out, weight_scale);
+            if (b != nullptr) {
+                out = ggml_add_inplace(ctx->ggml_ctx, out, b);
+            }
+        }
+        return out;
+    }
+
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
         this->prefix            = prefix;
         has_weight_scale        = false;
@@ -4246,67 +4608,63 @@ public:
         if (bias) {
             b = params["bias"];
         }
-        ggml_tensor* linear_bias = has_weight_scale ? nullptr : b;
-        ggml_tensor* out         = nullptr;
-        if (w->type == GGML_TYPE_I8) {
-            if (x->type != GGML_TYPE_F32) {
-                x = ggml_ext_cast_f32(ctx->ggml_ctx, ctx->backend, x);
-            }
-            if (!ggml_is_contiguous(x)) {
-                x = ggml_cont(ctx->ggml_ctx, x);
-            }
-            ggml_tensor* lora_input = x;
-            if (ctx->weight_adapter && b != nullptr) {
-                b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
-            }
-            if (int8_convrot && scale == 1.f) {
-                const auto cache_key = std::make_pair(x, int8_convrot_group_size);
-                auto cached          = ctx->int8_convrot_cache.find(cache_key);
-                if (cached == ctx->int8_convrot_cache.end()) {
-                    x = ggml_quantize_i8_convrot(ctx->ggml_ctx, x, int8_convrot_group_size);
-                    ctx->int8_convrot_cache.emplace(cache_key, x);
-                } else {
-                    x = cached->second;
-                }
-            }
-            out = ggml_ext_linear_i8_tensorwise(ctx->ggml_ctx,
-                                                x,
-                                                w,
-                                                params["weight_scale"],
-                                                b,
-                                                int8_convrot ? int8_convrot_group_size : 0,
-                                                scale);
-            if (ctx->weight_adapter) {
-                WeightAdapter::ForwardParams forward_params;
-                forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
-                forward_params.linear.force_prec_f32 = force_prec_f32;
-                forward_params.linear.scale          = scale;
-                out                                  = ctx->weight_adapter->add_lora_to_output(ctx->ggml_ctx,
-                                                                                               ctx->backend,
-                                                                                               lora_input,
-                                                                                               w,
-                                                                                               out,
-                                                                                               prefix,
-                                                                                               forward_params);
-            }
-            return out;
+        return forward_impl(ctx,
+                            x,
+                            w,
+                            b,
+                            has_weight_scale ? params["weight_scale"] : nullptr,
+                            0,
+                            -1);
+    }
+
+    ggml_tensor* forward_output_slice(GGMLRunnerContext* ctx,
+                                      ggml_tensor* x,
+                                      int64_t output_start,
+                                      int64_t output_end) {
+        GGML_ASSERT(output_start >= 0 && output_start < output_end && output_end <= out_features);
+        if (output_start == 0 && output_end == out_features) {
+            return forward(ctx, x);
         }
-        if (ctx->weight_adapter) {
-            WeightAdapter::ForwardParams forward_params;
-            forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
-            forward_params.linear.force_prec_f32 = force_prec_f32;
-            forward_params.linear.scale          = scale;
-            out                                  = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, linear_bias, prefix, forward_params);
-        } else {
-            out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
+        if (ctx->weight_adapter &&
+            !ctx->weight_adapter->supports_linear_output_slice(prefix,
+                                                               output_start,
+                                                               output_end,
+                                                               out_features)) {
+            return ggml_ext_slice(ctx->ggml_ctx,
+                                  forward(ctx, x),
+                                  0,
+                                  output_start,
+                                  output_end);
         }
-        if (has_weight_scale) {
-            out = ggml_mul(ctx->ggml_ctx, out, params["weight_scale"]);
-            if (b != nullptr) {
-                out = ggml_add_inplace(ctx->ggml_ctx, out, b);
-            }
-        }
-        return out;
+
+        auto w = ggml_ext_slice(ctx->ggml_ctx,
+                                params["weight"],
+                                1,
+                                output_start,
+                                output_end,
+                                false);
+        ggml_tensor* b = bias ? ggml_ext_slice(ctx->ggml_ctx,
+                                               params["bias"],
+                                               0,
+                                               output_start,
+                                               output_end,
+                                               false)
+                              : nullptr;
+        ggml_tensor* weight_scale = has_weight_scale
+                                        ? ggml_ext_slice(ctx->ggml_ctx,
+                                                         params["weight_scale"],
+                                                         0,
+                                                         output_start,
+                                                         output_end,
+                                                         false)
+                                        : nullptr;
+        return forward_impl(ctx,
+                            x,
+                            w,
+                            b,
+                            weight_scale,
+                            output_start,
+                            output_end);
     }
 };
 
@@ -4785,14 +5143,26 @@ public:
         : hidden_size(hidden_size),
           eps(eps) {}
 
-    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+    ggml_tensor* forward_impl(GGMLRunnerContext* ctx, ggml_tensor* x, bool inplace) {
         ggml_tensor* w = params["weight"];
         if (ctx->weight_adapter) {
             w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
         }
         x = ggml_rms_norm(ctx->ggml_ctx, x, eps);
-        x = ggml_mul_inplace(ctx->ggml_ctx, x, w);
+        if (!inplace && w->type != x->type) {
+            w = ggml_cast(ctx->ggml_ctx, w, x->type);
+        }
+        x = inplace ? ggml_mul_inplace(ctx->ggml_ctx, x, w)
+                    : ggml_mul(ctx->ggml_ctx, x, w);
         return x;
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        return forward_impl(ctx, x, true);
+    }
+
+    ggml_tensor* forward_out_of_place(GGMLRunnerContext* ctx, ggml_tensor* x) {
+        return forward_impl(ctx, x, false);
     }
 };
 

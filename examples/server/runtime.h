@@ -21,6 +21,7 @@ struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
     int listen_port       = 1234;
     std::string serve_html_path;
+    std::string output_dir;
     bool normal_exit = false;
     bool verbose     = false;
     bool color       = false;
@@ -56,6 +57,7 @@ struct ServerRuntime {
     std::vector<UpscalerEntry>* upscaler_cache;
     std::mutex* upscaler_mutex;
     AsyncJobManager* async_job_manager;
+    bool supports_attention_sparsity;
 };
 
 struct ImgGenJobRequest {
@@ -70,8 +72,20 @@ struct ImgGenJobRequest {
 
 struct VidGenJobRequest {
     SDGenerationParams gen_params;
-    std::string output_format = "webm";
-    int output_compression    = 100;
+    std::string output_format              = "webm";
+    int output_compression                 = 100;
+    bool has_minimax_h3_attention_sparsity = false;
+    float minimax_h3_attention_sparsity    = 0.0f;
+    bool save_conditioning                 = false;
+    bool conditioning_only                 = false;
+    bool save_latent                       = false;
+    bool latent_only                       = false;
+    std::string conditioning_input_path;
+    std::string conditioning_output_path;
+    std::string conditioning_output_file_name;
+    std::string latent_input_path;
+    std::string latent_output_path;
+    std::string latent_output_file_name;
 
     sd_vid_gen_params_t to_sd_vid_gen_params_t() {
         return gen_params.to_sd_vid_gen_params_t();

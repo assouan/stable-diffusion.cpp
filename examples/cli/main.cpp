@@ -896,9 +896,12 @@ int main(int argc, const char* argv[]) {
 
     sd_ctx_params_t sd_ctx_params                = ctx_params.to_sd_ctx_params_t(cli_params.taesd_preview);
     sd_layer_stream_params_t layer_stream_params = ctx_params.to_sd_layer_stream_params_t();
-    const uint32_t layer_stream_options          = ctx_params.stream_layer_pool
+    uint32_t layer_stream_options                = ctx_params.stream_layer_pool
                                                        ? SD_LAYER_STREAM_OPTION_POOL
                                                        : SD_LAYER_STREAM_OPTION_NONE;
+    if (ctx_params.stream_vram_safety == 0) {
+        layer_stream_options |= SD_LAYER_STREAM_OPTION_NO_VRAM_SAFETY;
+    }
 
     SDImageVec results;
     int num_results             = 0;

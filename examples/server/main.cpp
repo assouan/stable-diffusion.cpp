@@ -87,9 +87,12 @@ int main(int argc, const char** argv) {
 
     sd_ctx_params_t sd_ctx_params                = ctx_params.to_sd_ctx_params_t(false);
     sd_layer_stream_params_t layer_stream_params = ctx_params.to_sd_layer_stream_params_t();
-    const uint32_t layer_stream_options          = ctx_params.stream_layer_pool
+    uint32_t layer_stream_options                = ctx_params.stream_layer_pool
                                                        ? SD_LAYER_STREAM_OPTION_POOL
                                                        : SD_LAYER_STREAM_OPTION_NONE;
+    if (ctx_params.stream_vram_safety == 0) {
+        layer_stream_options |= SD_LAYER_STREAM_OPTION_NO_VRAM_SAFETY;
+    }
     SDCtxPtr sd_ctx(new_sd_ctx_with_layer_stream_options(&sd_ctx_params,
                                                          &layer_stream_params,
                                                          layer_stream_options));
@@ -106,6 +109,9 @@ int main(int argc, const char** argv) {
     std::vector<UpscalerEntry> upscaler_cache;
     std::mutex upscaler_mutex;
     AsyncJobManager async_job_manager;
+    float default_attention_sparsity       = 0.0f;
+    bool supports_attention_sparsity       = sd_ctx_get_attention_sparsity(sd_ctx.get(),
+                                                                           &default_attention_sparsity);
     ServerRuntime runtime = {
         sd_ctx.get(),
         &sd_ctx_mutex,
@@ -117,6 +123,7 @@ int main(int argc, const char** argv) {
         &upscaler_cache,
         &upscaler_mutex,
         &async_job_manager,
+        supports_attention_sparsity,
     };
 
     std::thread async_worker(async_job_worker, std::ref(runtime));

@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -13,6 +15,14 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <linux/aio_abi.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include "core/util.h"
 #include "model_io/gguf_io.h"
@@ -206,8 +216,242 @@ void convert_tensor(void* src,
 
 /*================================================= ModelLoader ==================================================*/
 
+struct ModelLoader::DirectStorageBufferCache {
+    struct IOBuffer {
+        ggml_backend_event_t event   = nullptr;
+        char* data                   = nullptr;
+        bool pending                 = false;
+    };
+
+    std::mutex mutex;
+    ggml_backend_t transfer_backend       = nullptr;
+    ggml_backend_buffer_t backing_buffer = nullptr;
+    size_t chunk_bytes                    = 0;
+    size_t buffer_stride                  = 0;
+    std::vector<IOBuffer> buffers;
+#ifdef __linux__
+    aio_context_t aio_context = 0;
+    bool aio_requested        = false;
+    bool aio_setup_attempted  = false;
+#endif
+
+    void release() {
+#ifdef __linux__
+        if (aio_context != 0) {
+            syscall(__NR_io_destroy, aio_context);
+            aio_context = 0;
+        }
+        aio_requested = false;
+        aio_setup_attempted = false;
+#endif
+        for (IOBuffer& buffer : buffers) {
+            if (buffer.event != nullptr) {
+                ggml_backend_event_free(buffer.event);
+            }
+        }
+        if (backing_buffer != nullptr) {
+            ggml_backend_buffer_free(backing_buffer);
+        }
+        buffers.clear();
+        transfer_backend = nullptr;
+        backing_buffer   = nullptr;
+        chunk_bytes      = 0;
+        buffer_stride    = 0;
+    }
+
+    bool prepare(ggml_backend_t requested_backend,
+                 size_t requested_chunk_bytes,
+                 size_t requested_buffer_count,
+                 bool requested_aio,
+                 std::string& error) {
+        ggml_backend_dev_t device = ggml_backend_get_device(requested_backend);
+        ggml_backend_buffer_type_t host_buffer_type =
+            device != nullptr ? ggml_backend_dev_host_buffer_type(device) : nullptr;
+        if (host_buffer_type == nullptr) {
+            error = "direct storage could not resolve a pinned host buffer type";
+            return false;
+        }
+
+        if (transfer_backend != requested_backend ||
+            chunk_bytes < requested_chunk_bytes ||
+            (!buffers.empty() && buffers.size() != requested_buffer_count)
+#ifdef __linux__
+            || aio_requested != requested_aio
+#endif
+        ) {
+            release();
+        }
+        transfer_backend = requested_backend;
+        chunk_bytes      = std::max(chunk_bytes, requested_chunk_bytes);
+        if (buffers.empty()) {
+            buffers.resize(requested_buffer_count);
+        }
+
+        constexpr size_t io_alignment = 4096;
+        if (chunk_bytes > SIZE_MAX - io_alignment) {
+            error = "direct storage staging stride overflowed";
+            return false;
+        }
+        buffer_stride = chunk_bytes + io_alignment;
+        if (requested_buffer_count > (SIZE_MAX - io_alignment) / buffer_stride) {
+            error = "direct storage staging allocation overflowed";
+            return false;
+        }
+        if (backing_buffer == nullptr) {
+            const size_t allocation_bytes =
+                requested_buffer_count * buffer_stride + io_alignment;
+            backing_buffer = ggml_backend_buft_alloc_buffer(host_buffer_type,
+                                                            allocation_bytes);
+            if (backing_buffer == nullptr ||
+                !ggml_backend_buffer_is_host(backing_buffer)) {
+                release();
+                error = "direct storage could not allocate a pinned host buffer";
+                return false;
+            }
+            uintptr_t base = reinterpret_cast<uintptr_t>(
+                ggml_backend_buffer_get_base(backing_buffer));
+            uintptr_t aligned =
+                (base + io_alignment - 1) & ~(static_cast<uintptr_t>(io_alignment) - 1);
+            for (size_t i = 0; i < buffers.size(); ++i) {
+                buffers[i].data = reinterpret_cast<char*>(
+                    aligned + i * buffer_stride);
+                buffers[i].event =
+                    device != nullptr ? ggml_backend_event_new(device) : nullptr;
+            }
+        }
+#ifdef __linux__
+        aio_requested = requested_aio;
+        if (requested_aio && !aio_setup_attempted) {
+            aio_setup_attempted = true;
+            aio_context_t context = 0;
+            if (syscall(__NR_io_setup,
+                        static_cast<unsigned>(requested_buffer_count),
+                        &context) == 0) {
+                aio_context = context;
+            }
+        }
+#else
+        (void)requested_aio;
+#endif
+        return true;
+    }
+
+#ifdef __linux__
+    void disable_aio() {
+        if (aio_context != 0) {
+            syscall(__NR_io_destroy, aio_context);
+            aio_context = 0;
+        }
+        aio_setup_attempted = true;
+    }
+#endif
+};
+
+struct DirectStorageConfig {
+    size_t chunk_bytes  = 0;
+    size_t buffer_count = 4;
+    bool use_aio        = true;
+};
+
+static bool get_direct_storage_config(DirectStorageConfig& config, std::string& error) {
+    uint64_t chunk_mib = 64;
+    if (const char* value = std::getenv("SD_DIRECT_STORAGE_BUFFER_MIB")) {
+        char* end                  = nullptr;
+        unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end != value && *end == '\0' && parsed >= 4 && parsed <= 1024) {
+            chunk_mib = parsed;
+        }
+    }
+    constexpr size_t io_alignment = 4096;
+    if (chunk_mib > SIZE_MAX / (1024 * 1024)) {
+        error = "direct storage buffer size overflowed";
+        return false;
+    }
+    config.chunk_bytes = static_cast<size_t>(chunk_mib) * 1024 * 1024;
+    if (config.chunk_bytes > SIZE_MAX - 2 * io_alignment) {
+        error = "direct storage buffer allocation overflowed";
+        return false;
+    }
+
+    if (const char* value = std::getenv("SD_DIRECT_STORAGE_BUFFER_COUNT")) {
+        char* end                  = nullptr;
+        unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end != value && *end == '\0' && parsed >= 1 && parsed <= 8) {
+            config.buffer_count = static_cast<size_t>(parsed);
+        }
+    }
+    if (const char* value = std::getenv("SD_DIRECT_STORAGE_AIO")) {
+        config.use_aio = std::strcmp(value, "0") != 0 &&
+                         std::strcmp(value, "false") != 0 &&
+                         std::strcmp(value, "off") != 0;
+    }
+    return true;
+}
+
 ModelLoader::ModelLoader()
-    : n_threads_(sd_get_num_physical_cores()) {
+    : direct_storage_buffers_(std::make_unique<DirectStorageBufferCache>()),
+      n_threads_(sd_get_num_physical_cores()) {
+}
+
+ModelLoader::~ModelLoader() {
+    release_direct_storage_buffers();
+}
+
+bool ModelLoader::prepare_direct_storage_buffers(ggml_backend_t transfer_backend,
+                                                 DirectStorageLoadStats* stats) {
+    DirectStorageLoadStats local_stats;
+    DirectStorageLoadStats& result = stats != nullptr ? *stats : local_stats;
+    result                         = {};
+    const auto start               = std::chrono::steady_clock::now();
+    auto finish                    = [&](bool success, const std::string& error = std::string()) {
+        result.total_seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        result.setup_seconds = result.total_seconds;
+        result.error         = error;
+        return success;
+    };
+
+#ifndef __linux__
+    (void)transfer_backend;
+    return finish(false, "direct storage is only available on Linux");
+#else
+    if (transfer_backend == nullptr) {
+        return finish(false, "direct storage requires a transfer backend");
+    }
+    constexpr size_t io_alignment = 4096;
+    DirectStorageConfig config;
+    std::string error;
+    if (!get_direct_storage_config(config, error)) {
+        return finish(false, error);
+    }
+    result.staging_buffer_count = config.buffer_count;
+    result.staging_bytes        = static_cast<uint64_t>(config.buffer_count) * config.chunk_bytes;
+
+    std::lock_guard<std::mutex> lock(direct_storage_buffers_->mutex);
+    if (!direct_storage_buffers_->prepare(transfer_backend,
+                                          config.chunk_bytes,
+                                          config.buffer_count,
+                                          config.use_aio,
+                                          error)) {
+        return finish(false, error);
+    }
+    result.staging_buffer_count = direct_storage_buffers_->buffers.size();
+    result.staging_bytes = static_cast<uint64_t>(result.staging_buffer_count) *
+                           direct_storage_buffers_->chunk_bytes;
+#ifdef __linux__
+    result.aio_used = direct_storage_buffers_->aio_context != 0;
+#endif
+    return finish(true);
+#endif
+}
+
+void ModelLoader::release_direct_storage_buffers() {
+    if (direct_storage_buffers_ == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(direct_storage_buffers_->mutex);
+    direct_storage_buffers_->release();
 }
 
 size_t ModelLoader::add_file_path(const std::string& file_path) {
@@ -1263,20 +1507,21 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
             });
         }
 
-        while (true) {
-            size_t current_idx = tensor_idx.load();
-            if (current_idx >= tensors_to_process.size() || failed) {
-                break;
-            }
-            size_t curr_num       = total_tensors_processed + current_idx;
-            float elapsed_seconds = (ggml_time_ms() - t_start) / 1000.0f;
-            if (log_progress && total_tensors_to_process > 0) {
+        if (log_progress) {
+            while (true) {
+                size_t current_idx = tensor_idx.load();
+                if (current_idx >= tensors_to_process.size() || failed) {
+                    break;
+                }
+                size_t curr_num       = total_tensors_processed + current_idx;
+                float elapsed_seconds = (ggml_time_ms() - t_start) / 1000.0f;
                 pretty_bytes_progress(static_cast<int>(curr_num),
                                       static_cast<int>(total_tensors_to_process),
                                       bytes_processed.load(),
                                       elapsed_seconds);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
         }
 
         for (auto& w : workers) {
@@ -1309,6 +1554,563 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                  (copy_to_backend_time_ms.load() / (float)last_n_threads) / 1000.f);
     }
     return success;
+}
+
+bool ModelLoader::load_tensors_direct(const std::map<std::string, ggml_tensor*>& tensors,
+                                      ggml_backend_t transfer_backend,
+                                      DirectStorageLoadStats* stats) {
+    DirectStorageLoadStats local_stats;
+    DirectStorageLoadStats& result = stats != nullptr ? *stats : local_stats;
+    result                         = {};
+    const auto total_start         = std::chrono::steady_clock::now();
+
+    auto finish = [&](bool success, const std::string& error = std::string()) {
+        result.total_seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - total_start)
+                                   .count();
+        result.error         = error;
+        return success;
+    };
+
+#ifndef __linux__
+    (void)tensors;
+    (void)transfer_backend;
+    return finish(false, "direct storage is only available on Linux");
+#else
+    if (tensors.empty()) {
+        return finish(true);
+    }
+    if (transfer_backend == nullptr) {
+        return finish(false, "direct storage requires a transfer backend");
+    }
+
+    process_model_files(false, false);
+
+    struct DirectTensor {
+        const TensorStorage* storage = nullptr;
+        ggml_tensor* tensor          = nullptr;
+    };
+    std::vector<std::vector<DirectTensor> > targets_by_file(file_data.size());
+    std::map<std::string, ggml_tensor*> buffered_targets;
+    std::set<std::string> found_names;
+    for (size_t file_index = 0; file_index < file_data.size(); ++file_index) {
+        const ModelFileData& model_file = file_data[file_index];
+        if (model_file.is_zip) {
+            continue;
+        }
+        for (const TensorStorage& storage : model_file.tensors) {
+            auto target = tensors.find(storage.name);
+            if (target == tensors.end()) {
+                continue;
+            }
+            ggml_tensor* tensor = target->second;
+            if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr) {
+                return finish(false, "direct storage target tensor is not allocated: " + storage.name);
+            }
+            if (ggml_backend_buffer_is_host(tensor->buffer)) {
+                return finish(false, "direct storage target tensor is not on a device: " + storage.name);
+            }
+            found_names.insert(storage.name);
+            if (!ggml_is_contiguous(tensor) ||
+                storage.type != tensor->type ||
+                storage.is_f8_e4m3 || storage.is_f8_e5m2 || storage.is_f64 || storage.is_i64 ||
+                storage.nbytes() != static_cast<int64_t>(ggml_nbytes(tensor))) {
+                buffered_targets.emplace(storage.name, tensor);
+                continue;
+            }
+            targets_by_file[file_index].push_back({&storage, tensor});
+        }
+    }
+    if (found_names.size() != tensors.size()) {
+        return finish(false, "direct storage could not resolve every target tensor");
+    }
+
+    auto load_buffered_targets = [&]() {
+        if (buffered_targets.empty()) {
+            return true;
+        }
+        std::set<std::string> target_names;
+        std::set<std::string> loaded_names;
+        std::mutex loaded_names_mutex;
+        for (const auto& target : buffered_targets) {
+            target_names.insert(target.first);
+            result.payload_bytes += ggml_nbytes(target.second);
+        }
+        auto on_new_tensor = [&](const TensorStorage& storage, ggml_tensor** destination) {
+            *destination = nullptr;
+            auto target  = buffered_targets.find(storage.name);
+            if (target == buffered_targets.end()) {
+                return true;
+            }
+            *destination = target->second;
+            std::lock_guard<std::mutex> lock(loaded_names_mutex);
+            loaded_names.insert(storage.name);
+            return true;
+        };
+        const auto buffered_start = std::chrono::steady_clock::now();
+        const bool loaded         = load_tensors(on_new_tensor,
+                                                 false,
+                                                 &target_names,
+                                                 false);
+        result.buffered_seconds += std::chrono::duration<double>(
+                                       std::chrono::steady_clock::now() - buffered_start)
+                                       .count();
+        result.buffered_tensor_count += loaded_names.size();
+        result.tensor_count += loaded_names.size();
+        return loaded && loaded_names.size() == buffered_targets.size();
+    };
+
+    const bool has_direct_targets = std::any_of(targets_by_file.begin(),
+                                                targets_by_file.end(),
+                                                [](const std::vector<DirectTensor>& targets) {
+                                                    return !targets.empty();
+                                                });
+    if (!has_direct_targets) {
+        const bool loaded = load_buffered_targets();
+        return finish(loaded,
+                      loaded ? std::string()
+                             : "buffered conversion fallback did not load every target tensor");
+    }
+
+    constexpr size_t io_alignment = 4096;
+    DirectStorageConfig config;
+    std::string error;
+    if (!get_direct_storage_config(config, error)) {
+        return finish(false, error);
+    }
+    const bool meta_direct_targets = std::any_of(
+        targets_by_file.begin(),
+        targets_by_file.end(),
+        [](const std::vector<DirectTensor>& targets) {
+            return std::any_of(targets.begin(), targets.end(), [](const DirectTensor& target) {
+                if (target.tensor == nullptr || target.tensor->buffer == nullptr) {
+                    return false;
+                }
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(target.tensor->buffer);
+                ggml_backend_dev_t dev          = buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr;
+                return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+            });
+        });
+    if (meta_direct_targets) {
+        size_t largest_tensor = 0;
+        for (const auto& file_targets : targets_by_file) {
+            for (const DirectTensor& target : file_targets) {
+                largest_tensor = std::max(largest_tensor,
+                                          static_cast<size_t>(target.storage->nbytes_to_read()));
+            }
+        }
+        constexpr size_t max_meta_staging_bytes = size_t{1024} * 1024 * 1024;
+        if (largest_tensor > max_meta_staging_bytes) {
+            return finish(false,
+                          "tensor-parallel direct storage needs a staging buffer larger than 1 GiB");
+        }
+        config.chunk_bytes = std::max(config.chunk_bytes,
+                                      (largest_tensor + io_alignment - 1) & ~(io_alignment - 1));
+        config.buffer_count = std::min<size_t>(config.buffer_count, 2);
+    }
+    const size_t chunk_bytes       = config.chunk_bytes;
+    result.staging_buffer_count    = config.buffer_count;
+    result.staging_bytes = static_cast<uint64_t>(config.buffer_count) * config.chunk_bytes;
+
+    const auto setup_start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> cache_lock(direct_storage_buffers_->mutex);
+    DirectStorageBufferCache& cache = *direct_storage_buffers_;
+    if (!cache.prepare(transfer_backend,
+                        config.chunk_bytes,
+                        config.buffer_count,
+                        config.use_aio,
+                        error)) {
+        return finish(false, error);
+    }
+    result.staging_buffer_count = cache.buffers.size();
+    result.staging_bytes = static_cast<uint64_t>(result.staging_buffer_count) *
+                           cache.chunk_bytes;
+    result.aio_used = cache.aio_context != 0;
+    std::vector<DirectStorageBufferCache::IOBuffer>& io_buffers = cache.buffers;
+
+    auto wait_buffer = [&](DirectStorageBufferCache::IOBuffer& buffer) {
+        if (!buffer.pending) {
+            return;
+        }
+        const auto wait_start = std::chrono::steady_clock::now();
+        if (buffer.event != nullptr) {
+            ggml_backend_event_synchronize(buffer.event);
+        } else {
+            ggml_backend_synchronize(transfer_backend);
+        }
+        result.wait_seconds += std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - wait_start)
+                                   .count();
+        buffer.pending = false;
+    };
+    auto synchronize_buffers = [&]() {
+        for (DirectStorageBufferCache::IOBuffer& buffer : io_buffers) {
+            wait_buffer(buffer);
+        }
+    };
+
+    result.setup_seconds += std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - setup_start)
+                                 .count();
+
+    size_t next_buffer = 0;
+    bool retry_without_aio = false;
+    for (size_t file_index = 0; file_index < targets_by_file.size() && error.empty(); ++file_index) {
+        std::vector<DirectTensor>& file_targets = targets_by_file[file_index];
+        if (file_targets.empty()) {
+            continue;
+        }
+        std::sort(file_targets.begin(), file_targets.end(), [](const DirectTensor& lhs, const DirectTensor& rhs) {
+            return lhs.storage->offset < rhs.storage->offset;
+        });
+
+        const std::string& path = file_data[file_index].path;
+        int fd                  = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (fd < 0) {
+            error = "open(O_DIRECT) failed for '" + path + "': " + std::strerror(errno);
+            break;
+        }
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+        struct stat file_stat{};
+        if (fstat(fd, &file_stat) != 0) {
+            error = "fstat failed for '" + path + "': " + std::strerror(errno);
+            close(fd);
+            break;
+        }
+        const uint64_t file_bytes = static_cast<uint64_t>(file_stat.st_size);
+
+        if (cache.aio_context != 0) {
+            struct DirectCopySlice {
+                const DirectTensor* target = nullptr;
+                uint64_t tensor_offset     = 0;
+                size_t buffer_offset       = 0;
+                size_t copy_bytes          = 0;
+            };
+            struct DirectReadTask {
+                uint64_t read_offset  = 0;
+                size_t required_bytes = 0;
+                size_t read_bytes     = 0;
+                std::vector<DirectCopySlice> copies;
+            };
+            std::vector<DirectReadTask> tasks;
+            for (const DirectTensor& target : file_targets) {
+                const TensorStorage& storage = *target.storage;
+                const uint64_t tensor_bytes  = static_cast<uint64_t>(storage.nbytes_to_read());
+                if (storage.offset > file_bytes || tensor_bytes > file_bytes - storage.offset) {
+                    error = "direct storage tensor exceeds its file: " + storage.name;
+                    break;
+                }
+            }
+
+            auto append_tensor_tasks = [&](const DirectTensor& target) {
+                const TensorStorage& storage = *target.storage;
+                const uint64_t tensor_bytes  = static_cast<uint64_t>(storage.nbytes_to_read());
+                for (uint64_t tensor_offset = 0; tensor_offset < tensor_bytes;) {
+                    const uint64_t source_offset = storage.offset + tensor_offset;
+                    const uint64_t read_offset =
+                        source_offset & ~(static_cast<uint64_t>(io_alignment) - 1);
+                    const size_t prefix = static_cast<size_t>(source_offset - read_offset);
+                    const size_t copy_bytes = static_cast<size_t>(
+                        std::min<uint64_t>(chunk_bytes, tensor_bytes - tensor_offset));
+                    const size_t required_bytes = prefix + copy_bytes;
+                    const size_t read_bytes =
+                        (required_bytes + io_alignment - 1) & ~(io_alignment - 1);
+                    DirectReadTask task;
+                    task.read_offset    = read_offset;
+                    task.required_bytes = required_bytes;
+                    task.read_bytes     = read_bytes;
+                    task.copies.push_back({&target, tensor_offset, prefix, copy_bytes});
+                    tasks.push_back(std::move(task));
+                    tensor_offset += copy_bytes;
+                }
+            };
+
+            constexpr uint64_t max_coalesce_gap = 1024 * 1024;
+            for (size_t group_begin = 0;
+                 group_begin < file_targets.size() && error.empty();) {
+                size_t group_end_index = group_begin + 1;
+                uint64_t group_start   = file_targets[group_begin].storage->offset;
+                uint64_t group_end     = group_start +
+                                         static_cast<uint64_t>(
+                                             file_targets[group_begin].storage->nbytes_to_read());
+                while (group_end_index < file_targets.size()) {
+                    const TensorStorage& next = *file_targets[group_end_index].storage;
+                    const uint64_t next_bytes = static_cast<uint64_t>(next.nbytes_to_read());
+                    const uint64_t gap = next.offset > group_end ? next.offset - group_end : 0;
+                    if (gap > max_coalesce_gap) {
+                        break;
+                    }
+                    group_end = std::max(group_end, next.offset + next_bytes);
+                    ++group_end_index;
+                }
+
+                const uint64_t aligned_group_start =
+                    group_start & ~(static_cast<uint64_t>(io_alignment) - 1);
+                const uint64_t group_span = group_end - aligned_group_start;
+                const uint64_t coalesced_task_count =
+                    group_span == 0 ? 0 : 1 + (group_span - 1) / chunk_bytes;
+                const bool keep_queue_deep = !meta_direct_targets &&
+                                             coalesced_task_count >= 2 * io_buffers.size();
+                if (!keep_queue_deep) {
+                    for (size_t target_index = group_begin;
+                         target_index < group_end_index;
+                         ++target_index) {
+                        append_tensor_tasks(file_targets[target_index]);
+                    }
+                    group_begin = group_end_index;
+                    continue;
+                }
+
+                uint64_t read_offset = aligned_group_start;
+                while (read_offset < group_end) {
+                    const uint64_t required_end =
+                        group_end - read_offset > chunk_bytes
+                            ? read_offset + chunk_bytes
+                            : group_end;
+                    DirectReadTask task;
+                    task.read_offset    = read_offset;
+                    task.required_bytes = static_cast<size_t>(required_end - read_offset);
+                    task.read_bytes =
+                        (task.required_bytes + io_alignment - 1) & ~(io_alignment - 1);
+
+                    for (size_t target_index = group_begin;
+                         target_index < group_end_index;
+                         ++target_index) {
+                        const DirectTensor& target = file_targets[target_index];
+                        const uint64_t tensor_start = target.storage->offset;
+                        const uint64_t tensor_end =
+                            tensor_start + static_cast<uint64_t>(target.storage->nbytes_to_read());
+                        const uint64_t copy_start = std::max(read_offset, tensor_start);
+                        const uint64_t copy_end   = std::min(required_end, tensor_end);
+                        if (copy_start < copy_end) {
+                            task.copies.push_back({&target,
+                                                   copy_start - tensor_start,
+                                                   static_cast<size_t>(copy_start - read_offset),
+                                                   static_cast<size_t>(copy_end - copy_start)});
+                        }
+                    }
+                    if (!task.copies.empty()) {
+                        tasks.push_back(std::move(task));
+                    }
+                    read_offset = required_end;
+                }
+                group_begin = group_end_index;
+            }
+
+            if (error.empty()) {
+                synchronize_buffers();
+                std::vector<struct iocb> requests(io_buffers.size());
+                std::vector<const DirectReadTask*> active_tasks(io_buffers.size(), nullptr);
+                std::vector<struct io_event> completions(io_buffers.size());
+                size_t next_task = 0;
+                size_t in_flight = 0;
+
+                auto submit_task = [&](size_t slot) {
+                    const DirectReadTask& task = tasks[next_task];
+                    struct iocb& request       = requests[slot];
+                    std::memset(&request, 0, sizeof(request));
+                    request.aio_data       = static_cast<__u64>(slot + 1);
+                    request.aio_lio_opcode = IOCB_CMD_PREAD;
+                    request.aio_fildes     = static_cast<__u32>(fd);
+                    request.aio_buf        = reinterpret_cast<__u64>(io_buffers[slot].data);
+                    request.aio_nbytes     = static_cast<__u64>(task.read_bytes);
+                    request.aio_offset     = static_cast<__s64>(task.read_offset);
+                    struct iocb* request_ptr = &request;
+                    long submitted;
+                    do {
+                        submitted = syscall(__NR_io_submit,
+                                            cache.aio_context,
+                                            1L,
+                                            &request_ptr);
+                    } while (submitted < 0 && errno == EINTR);
+                    if (submitted != 1) {
+                        error = "io_submit failed for '" + path + "': " + std::strerror(errno);
+                        return false;
+                    }
+                    active_tasks[slot] = &task;
+                    ++next_task;
+                    ++in_flight;
+                    ++result.storage_request_count;
+                    return true;
+                };
+
+                for (size_t slot = 0;
+                     slot < io_buffers.size() && next_task < tasks.size() && error.empty();
+                     ++slot) {
+                    submit_task(slot);
+                }
+
+                while (in_flight > 0 && error.empty()) {
+                    const auto read_start = std::chrono::steady_clock::now();
+                    long completed;
+                    do {
+                        completed = syscall(__NR_io_getevents,
+                                            cache.aio_context,
+                                            1L,
+                                            static_cast<long>(completions.size()),
+                                            completions.data(),
+                                            nullptr);
+                    } while (completed < 0 && errno == EINTR);
+                    result.read_seconds += std::chrono::duration<double>(
+                                               std::chrono::steady_clock::now() - read_start)
+                                               .count();
+                    if (completed < 0) {
+                        error = "io_getevents failed for '" + path + "': " + std::strerror(errno);
+                        break;
+                    }
+
+                    for (long event_index = 0; event_index < completed && error.empty(); ++event_index) {
+                        const struct io_event& completion =
+                            completions[static_cast<size_t>(event_index)];
+                        if (completion.data == 0 || completion.data > io_buffers.size()) {
+                            error = "io_getevents returned an invalid direct-storage buffer";
+                            break;
+                        }
+                        const size_t slot = static_cast<size_t>(completion.data - 1);
+                        const DirectReadTask* task = active_tasks[slot];
+                        active_tasks[slot]         = nullptr;
+                        --in_flight;
+                        if (task == nullptr) {
+                            error = "io_getevents returned an inactive direct-storage buffer";
+                            break;
+                        }
+                        if (completion.res < 0) {
+                            error = "asynchronous O_DIRECT read failed for '" + path + "': " +
+                                    std::strerror(static_cast<int>(-completion.res));
+                            break;
+                        }
+                        result.storage_bytes += static_cast<uint64_t>(completion.res);
+                        if (static_cast<size_t>(completion.res) < task->required_bytes) {
+                            error = "short asynchronous O_DIRECT read for '" + path + "'";
+                            break;
+                        }
+
+                        DirectStorageBufferCache::IOBuffer& io_buffer = io_buffers[slot];
+                        const auto copy_start = std::chrono::steady_clock::now();
+                        for (const DirectCopySlice& copy : task->copies) {
+                            ggml_backend_tensor_set_async(transfer_backend,
+                                                          copy.target->tensor,
+                                                          io_buffer.data + copy.buffer_offset,
+                                                          static_cast<size_t>(copy.tensor_offset),
+                                                          copy.copy_bytes);
+                            result.payload_bytes += copy.copy_bytes;
+                        }
+                        if (io_buffer.event != nullptr) {
+                            ggml_backend_event_record(io_buffer.event, transfer_backend);
+                        }
+                        io_buffer.pending = true;
+                        result.copy_seconds += std::chrono::duration<double>(
+                                                   std::chrono::steady_clock::now() - copy_start)
+                                                   .count();
+
+                        if (next_task < tasks.size()) {
+                            wait_buffer(io_buffer);
+                            submit_task(slot);
+                        }
+                    }
+                }
+
+                if (!error.empty()) {
+                    cache.disable_aio();
+                    retry_without_aio = true;
+                } else {
+                    result.direct_tensor_count += file_targets.size();
+                    result.tensor_count += file_targets.size();
+                }
+            }
+        } else {
+            for (const DirectTensor& target : file_targets) {
+                const TensorStorage& storage = *target.storage;
+                const uint64_t tensor_bytes  = static_cast<uint64_t>(storage.nbytes_to_read());
+                if (storage.offset > file_bytes || tensor_bytes > file_bytes - storage.offset) {
+                    error = "direct storage tensor exceeds its file: " + storage.name;
+                    break;
+                }
+
+                uint64_t tensor_offset = 0;
+                while (tensor_offset < tensor_bytes) {
+                    DirectStorageBufferCache::IOBuffer& io_buffer =
+                        io_buffers[next_buffer % io_buffers.size()];
+                    ++next_buffer;
+                    wait_buffer(io_buffer);
+
+                    const uint64_t source_offset = storage.offset + tensor_offset;
+                    const uint64_t read_offset =
+                        source_offset & ~(static_cast<uint64_t>(io_alignment) - 1);
+                    const size_t prefix = static_cast<size_t>(source_offset - read_offset);
+                    const size_t copy_bytes = static_cast<size_t>(
+                        std::min<uint64_t>(chunk_bytes, tensor_bytes - tensor_offset));
+                    const size_t required_bytes = prefix + copy_bytes;
+                    const size_t read_bytes =
+                        (required_bytes + io_alignment - 1) & ~(io_alignment - 1);
+
+                    const auto read_start = std::chrono::steady_clock::now();
+                    size_t bytes_read     = 0;
+                    while (bytes_read < read_bytes) {
+                        ssize_t count = pread(fd,
+                                              io_buffer.data + bytes_read,
+                                              read_bytes - bytes_read,
+                                              static_cast<off_t>(read_offset + bytes_read));
+                        if (count < 0 && errno == EINTR) {
+                            continue;
+                        }
+                        if (count <= 0) {
+                            break;
+                        }
+                        bytes_read += static_cast<size_t>(count);
+                    }
+                    result.read_seconds += std::chrono::duration<double>(
+                                               std::chrono::steady_clock::now() - read_start)
+                                               .count();
+                    result.storage_bytes += bytes_read;
+                    ++result.storage_request_count;
+                    if (bytes_read < required_bytes) {
+                        error = "short O_DIRECT read for tensor: " + storage.name;
+                        break;
+                    }
+
+                    const auto copy_start = std::chrono::steady_clock::now();
+                    ggml_backend_tensor_set_async(transfer_backend,
+                                                  target.tensor,
+                                                  io_buffer.data + prefix,
+                                                  static_cast<size_t>(tensor_offset),
+                                                  copy_bytes);
+                    if (io_buffer.event != nullptr) {
+                        ggml_backend_event_record(io_buffer.event, transfer_backend);
+                    }
+                    io_buffer.pending = true;
+                    result.copy_seconds += std::chrono::duration<double>(
+                                               std::chrono::steady_clock::now() - copy_start)
+                                               .count();
+                    result.payload_bytes += copy_bytes;
+                    tensor_offset += copy_bytes;
+                }
+                if (!error.empty()) {
+                    break;
+                }
+                ++result.direct_tensor_count;
+                ++result.tensor_count;
+            }
+        }
+        close(fd);
+    }
+
+    synchronize_buffers();
+    if (retry_without_aio) {
+        LOG_WARN("Linux AIO unavailable (%s); retrying with synchronous O_DIRECT reads",
+                 error.c_str());
+        cache_lock.unlock();
+        return load_tensors_direct(tensors, transfer_backend, stats);
+    }
+    if (!error.empty()) {
+        return finish(false, error);
+    }
+    if (!load_buffered_targets()) {
+        return finish(false, "buffered conversion fallback did not load every target tensor");
+    }
+    return finish(true);
+#endif
 }
 
 bool ModelLoader::load_tensor(const TensorStorage& tensor_storage, ggml_tensor* dst_tensor) {

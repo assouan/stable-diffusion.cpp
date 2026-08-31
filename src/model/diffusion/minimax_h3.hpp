@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
@@ -16,17 +17,21 @@
 
 namespace MiniMaxH3 {
 
-    constexpr int H3_GRAPH_SIZE          = 131072;
+    constexpr size_t H3_GRAPH_SIZE       = 524288;
+    constexpr size_t H3_TENSOR_CAPACITY  = 655360;
     constexpr float FRAME_RESCALE        = 5.f / 3.f;
     constexpr float VISUAL_COND_TIMESTEP = 0.999f;
 
     struct Config {
         int64_t hidden_size              = 5376;
         int64_t num_layers               = 50;
+        int64_t execution_layers         = 50;
         int64_t token_refiner_num_layers = 2;
         int64_t num_attention_heads      = 56;
         int64_t attention_head_dim       = 128;
         int64_t ffn_hidden_size          = 14336;
+        int64_t mlp_chunk_size           = 4096;
+        int64_t attention_chunk_size     = 4096;
         int64_t video_latent_channels    = 24;
         int64_t audio_latent_channels    = 32;
         int64_t text_dim                 = 5120;
@@ -41,6 +46,9 @@ namespace MiniMaxH3 {
         float norm_eps                   = 1e-5f;
         float qk_norm_eps                = 1e-5f;
         float final_norm_eps             = 1e-5f;
+        float attention_sparsity         = 0.0f;
+        bool sequence_parallel            = false;
+        ggml_type activation_storage_type = GGML_TYPE_BF16;
 
         bool uses_adaln_curves() const {
             return adaln_curve_grid > 0;
@@ -78,6 +86,7 @@ namespace MiniMaxH3 {
                 config.audio_latent_channels = weight->ne[0];
             }
             config.num_layers               = count_blocks(tensors, prefix + ".blocks.");
+            config.execution_layers         = config.num_layers;
             config.token_refiner_num_layers = count_blocks(tensors, prefix + ".token_refiner.blocks.");
             if (const auto* weight = find("blocks.0.attn.q_norm.weight")) {
                 config.attention_head_dim = weight->ne[0];
@@ -144,20 +153,65 @@ namespace MiniMaxH3 {
         }
     };
 
+    static ggml_tensor* concat_balanced(ggml_context* ctx,
+                                        std::vector<ggml_tensor*> tensors,
+                                        int dim) {
+        GGML_ASSERT(!tensors.empty());
+        while (tensors.size() > 1) {
+            std::vector<ggml_tensor*> next;
+            next.reserve((tensors.size() + 1) / 2);
+            for (size_t i = 0; i < tensors.size(); i += 2) {
+                next.push_back(i + 1 < tensors.size()
+                                   ? ggml_concat(ctx, tensors[i], tensors[i + 1], dim)
+                                   : tensors[i]);
+            }
+            tensors = std::move(next);
+        }
+        return tensors.front();
+    }
+
     struct MLP : public UnaryBlock {
+        int64_t chunk_size;
+
         MLP(int64_t hidden_size,
-            int64_t ffn_hidden_size) {
+            int64_t ffn_hidden_size,
+            int64_t chunk_size)
+            : chunk_size(chunk_size) {
             blocks["fc1"] = std::make_shared<Linear>(hidden_size, ffn_hidden_size * 2, false, false, true, 1.f / 128.f);
             blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size, hidden_size, false, false, true, 1.f / 128.f);
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        ggml_tensor* forward_chunk(GGMLRunnerContext* ctx, ggml_tensor* x) {
             auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
-            auto uv  = ggml_ext_chunk(ctx->ggml_ctx, fc1->forward(ctx, x), 2, 0);
-            return fc2->forward(ctx, ggml_mul(ctx->ggml_ctx,
-                                              ggml_silu(ctx->ggml_ctx, uv[0]),
-                                              uv[1]));
+            auto uv  = fc1->forward(ctx, x);
+            return fc2->forward(ctx, ggml_glu(ctx->ggml_ctx,
+                                              uv,
+                                              GGML_GLU_OP_SWIGLU,
+                                              false));
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+            if (chunk_size <= 0 || x->ne[1] <= chunk_size) {
+                return forward_chunk(ctx, x);
+            }
+
+            std::vector<ggml_tensor*> outputs;
+            outputs.reserve(static_cast<size_t>((x->ne[1] + chunk_size - 1) / chunk_size));
+            for (int64_t start = 0; start < x->ne[1]; start += chunk_size) {
+                int64_t end = std::min(start + chunk_size, x->ne[1]);
+                auto output = forward_chunk(ctx,
+                                            ggml_ext_slice(ctx->ggml_ctx,
+                                                           x,
+                                                           1,
+                                                           start,
+                                                           end));
+                ggml_format_name(output, "h3.mlp.chunk.%lld", (long long) (start / chunk_size));
+                outputs.push_back(output);
+            }
+            auto output = concat_balanced(ctx->ggml_ctx, std::move(outputs), 1);
+            ggml_set_name(output, "h3.mlp.output");
+            return output;
         }
     };
 
@@ -185,12 +239,16 @@ namespace MiniMaxH3 {
     struct Attention : public GGMLBlock {
         int64_t heads;
         int64_t head_dim;
+        int64_t chunk_size;
+        float sparsity;
 
         Attention(int64_t hidden_size,
                   int64_t heads,
                   int64_t head_dim,
-                  float eps)
-            : heads(heads), head_dim(head_dim) {
+                  float eps,
+                  int64_t chunk_size,
+                  float sparsity = 0.0f)
+            : heads(heads), head_dim(head_dim), chunk_size(chunk_size), sparsity(sparsity) {
             int64_t inner      = heads * head_dim;
             blocks["qkv_proj"] = std::make_shared<Linear>(hidden_size, inner * 3, false);
             blocks["q_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
@@ -198,9 +256,13 @@ namespace MiniMaxH3 {
             blocks["out_proj"] = std::make_shared<Linear>(inner, hidden_size, false);
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx,
-                             ggml_tensor* x,
-                             ggml_tensor* pe = nullptr) {
+        void set_sparsity(float value) {
+            sparsity = value;
+        }
+
+        ggml_tensor* forward_full(GGMLRunnerContext* ctx,
+                                  ggml_tensor* x,
+                                  ggml_tensor* pe) {
             auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv_proj"]);
             auto q_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
             auto k_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
@@ -230,8 +292,254 @@ namespace MiniMaxH3 {
                                               nullptr,
                                               true,
                                               ctx->flash_attn_enabled,
-                                              1.f / 128.f);
+                                              1.f / 128.f,
+                                              sparsity);
             return out_proj->forward(ctx, out);
+        }
+
+        std::vector<ggml_tensor*> forward_chunks(
+            GGMLRunnerContext* ctx,
+            int64_t sequence,
+            int64_t batch,
+            ggml_tensor* pe,
+            const std::function<ggml_tensor*(int64_t, int64_t)>& input_for_range) {
+            auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv_proj"]);
+            auto q_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
+            auto k_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
+            auto out_proj = std::dynamic_pointer_cast<Linear>(blocks["out_proj"]);
+
+            int64_t inner = heads * head_dim;
+            std::vector<ggml_tensor*> keys;
+            std::vector<ggml_tensor*> values;
+            size_t chunk_count = static_cast<size_t>((sequence + chunk_size - 1) / chunk_size);
+            keys.reserve(chunk_count);
+            values.reserve(chunk_count);
+
+            for (int64_t start = 0; start < sequence; start += chunk_size) {
+                int64_t end          = std::min(start + chunk_size, sequence);
+                int64_t chunk_tokens = end - start;
+                auto input           = input_for_range(start, end);
+                auto k               = qkv_proj->forward_output_slice(ctx,
+                                                                       input,
+                                                                       inner,
+                                                                       inner * 2);
+                k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, heads, chunk_tokens, batch);
+                k                    = k_norm->forward(ctx, k);
+                if (pe != nullptr) {
+                    auto pe_chunk = ggml_ext_slice(ctx->ggml_ctx, pe, 3, start, end);
+                    k             = apply_partial_rope(ctx->ggml_ctx, k, pe_chunk);
+                } else {
+                    k = attention_layout(ctx->ggml_ctx, k);
+                }
+
+                k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, chunk_tokens, heads, batch);
+                k = ggml_cast(ctx->ggml_ctx,
+                              ggml_ext_scale(ctx->ggml_ctx, k, 1.f / 128.f),
+                              GGML_TYPE_F16);
+                ggml_format_name(k, "h3.attn.k.%lld", (long long) (start / chunk_size));
+                keys.push_back(k);
+                auto v               = qkv_proj->forward_output_slice(ctx,
+                                                                       input,
+                                                                       inner * 2,
+                                                                       inner * 3);
+                v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, heads, chunk_tokens, batch);
+                v = ggml_ext_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 0, 2, 1, 3));
+                v = ggml_cast(ctx->ggml_ctx,
+                              ggml_ext_scale(ctx->ggml_ctx, v, 1.f / 128.f),
+                              GGML_TYPE_F16);
+                ggml_format_name(v, "h3.attn.v.%lld", (long long) (start / chunk_size));
+                values.push_back(v);
+            }
+            auto k = concat_balanced(ctx->ggml_ctx, std::move(keys), 1);
+            ggml_set_name(k, "h3.attn.k.all");
+            auto v = concat_balanced(ctx->ggml_ctx, std::move(values), 1);
+            ggml_set_name(v, "h3.attn.v.all");
+            std::vector<ggml_tensor*> outputs;
+            outputs.reserve(chunk_count);
+            for (int64_t start = 0; start < sequence; start += chunk_size) {
+                int64_t end          = std::min(start + chunk_size, sequence);
+                int64_t chunk_tokens = end - start;
+                auto input           = input_for_range(start, end);
+                auto q               = qkv_proj->forward_output_slice(ctx,
+                                                                       input,
+                                                                       0,
+                                                                       inner);
+                q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, heads, chunk_tokens, batch);
+                q = q_norm->forward(ctx, q);
+                if (pe != nullptr) {
+                    auto pe_chunk = ggml_ext_slice(ctx->ggml_ctx, pe, 3, start, end);
+                    q             = apply_partial_rope(ctx->ggml_ctx, q, pe_chunk);
+                } else {
+                    q = attention_layout(ctx->ggml_ctx, q);
+                }
+                q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, chunk_tokens, heads, batch);
+                ggml_format_name(q, "h3.attn.q.%lld", (long long) (start / chunk_size));
+                auto out = ggml_ext_attention_ext(ctx->ggml_ctx,
+                                                  ctx->backend,
+                                                  q,
+                                                  k,
+                                                  v,
+                                                  static_cast<int>(heads),
+                                                  nullptr,
+                                                  true,
+                                                  true,
+                                                  1.f / 128.f,
+                                                  sparsity,
+                                                  true);
+                auto output = out_proj->forward(ctx, out);
+                ggml_format_name(output,
+                                 "h3.attn.output.%lld",
+                                 (long long) (start / chunk_size));
+                outputs.push_back(output);
+            }
+            return outputs;
+        }
+
+        ggml_tensor* forward_sequence_parallel(GGMLRunnerContext* ctx,
+                                               ggml_tensor* x,
+                                               ggml_tensor* pe,
+                                               ggml_type wire_type,
+                                               const std::string& qkv_cut_group) {
+            auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv_proj"]);
+            auto q_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
+            auto k_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
+            auto out_proj = std::dynamic_pointer_cast<Linear>(blocks["out_proj"]);
+
+            const int64_t sequence = x->ne[1];
+            const int64_t batch    = x->ne[2] * x->ne[3];
+            GGML_ASSERT(batch == 1);
+
+            if (x->type != wire_type) {
+                x = ggml_cast(ctx->ggml_ctx, x, wire_type);
+            }
+            x = ggml_backend_meta_all_gather(ctx->ggml_ctx,
+                                             ggml_cont(ctx->ggml_ctx, x),
+                                             GGML_BACKEND_SPLIT_AXIS_1);
+            ggml_set_name(x, "h3.sequence.attn.hidden.gathered");
+
+            const int64_t projection_chunk_size = std::max<int64_t>(1, chunk_size);
+            std::vector<ggml_tensor*> qkv_chunks;
+            qkv_chunks.reserve(static_cast<size_t>((sequence + projection_chunk_size - 1) /
+                                                   projection_chunk_size));
+            for (int64_t start = 0; start < sequence; start += projection_chunk_size) {
+                const int64_t end = std::min(start + projection_chunk_size, sequence);
+                auto input_chunk = ggml_ext_slice(ctx->ggml_ctx, x, 1, start, end);
+                auto qkv_chunk = ggml_cast(ctx->ggml_ctx,
+                                           qkv_proj->forward(ctx, input_chunk),
+                                           GGML_TYPE_F16);
+                ggml_format_name(qkv_chunk,
+                                 "h3.sequence.attn.qkv.%lld",
+                                 (long long) (start / projection_chunk_size));
+                qkv_chunks.push_back(qkv_chunk);
+            }
+            auto qkv = concat_balanced(ctx->ggml_ctx, std::move(qkv_chunks), 1);
+            ggml_set_name(qkv, "h3.sequence.attn.qkv");
+            if (!qkv_cut_group.empty()) {
+                sd::ggml_graph_cut::mark_graph_cut(qkv, qkv_cut_group, "qkv");
+            }
+            auto qkv_parts = ggml_ext_chunk(ctx->ggml_ctx, qkv, 3, 0);
+
+            auto q = ggml_cast(ctx->ggml_ctx, qkv_parts[0], GGML_TYPE_F32);
+            q      = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, heads, sequence, batch);
+            q      = q_norm->forward_out_of_place(ctx, q);
+            q      = pe != nullptr ? apply_partial_rope(ctx->ggml_ctx, q, pe)
+                                   : attention_layout(ctx->ggml_ctx, q);
+            q      = ggml_cont(ctx->ggml_ctx, q);
+
+            auto k = ggml_cast(ctx->ggml_ctx, qkv_parts[1], GGML_TYPE_F32);
+            k      = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, heads, sequence, batch);
+            k      = k_norm->forward_out_of_place(ctx, k);
+            k      = pe != nullptr ? apply_partial_rope(ctx->ggml_ctx, k, pe)
+                                   : attention_layout(ctx->ggml_ctx, k);
+            k      = ggml_cast(ctx->ggml_ctx,
+                               ggml_ext_scale(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, k), 1.f / 128.f),
+                               GGML_TYPE_F16);
+
+            auto v = ggml_cast(ctx->ggml_ctx, qkv_parts[2], GGML_TYPE_F32);
+            v = ggml_reshape_4d(ctx->ggml_ctx,
+                                v,
+                                head_dim,
+                                heads,
+                                sequence,
+                                batch);
+            v = ggml_ext_cont(ctx->ggml_ctx,
+                              ggml_permute(ctx->ggml_ctx, v, 0, 2, 1, 3));
+            v = ggml_cast(ctx->ggml_ctx,
+                          ggml_ext_scale(ctx->ggml_ctx, v, 1.f / 128.f),
+                          GGML_TYPE_F16);
+
+            const int64_t attention_query_chunk_size = sparsity > 0.0f
+                                                           ? sequence
+                                                           : projection_chunk_size;
+            std::vector<ggml_tensor*> attention_chunks;
+            attention_chunks.reserve(static_cast<size_t>((sequence + attention_query_chunk_size - 1) /
+                                                         attention_query_chunk_size));
+            for (int64_t start = 0; start < sequence; start += attention_query_chunk_size) {
+                const int64_t end = std::min(start + attention_query_chunk_size, sequence);
+                auto q_chunk = ggml_cont(ctx->ggml_ctx,
+                                         ggml_ext_slice(ctx->ggml_ctx, q, 1, start, end));
+                auto out_chunk = ggml_ext_attention_ext(ctx->ggml_ctx,
+                                                        ctx->backend,
+                                                        q_chunk,
+                                                        k,
+                                                        v,
+                                                        static_cast<int>(heads),
+                                                        nullptr,
+                                                        true,
+                                                        true,
+                                                        1.f / 128.f,
+                                                        sparsity,
+                                                        true);
+                if (out_chunk->type != wire_type) {
+                    out_chunk = ggml_cast(ctx->ggml_ctx, out_chunk, wire_type);
+                }
+                ggml_format_name(out_chunk,
+                                 "h3.sequence.attn.output.%lld",
+                                 (long long) (start / attention_query_chunk_size));
+                attention_chunks.push_back(out_chunk);
+            }
+            auto out = concat_balanced(ctx->ggml_ctx, std::move(attention_chunks), 1);
+            out = ggml_backend_meta_all_to_all(ctx->ggml_ctx,
+                                               ggml_cont(ctx->ggml_ctx, out),
+                                               GGML_BACKEND_SPLIT_AXIS_0,
+                                               GGML_BACKEND_SPLIT_AXIS_1);
+            ggml_set_name(out, "h3.sequence.attn.output.all_to_all");
+            std::vector<ggml_tensor*> projected_chunks;
+            projected_chunks.reserve(static_cast<size_t>((sequence + projection_chunk_size - 1) /
+                                                          projection_chunk_size));
+            for (int64_t start = 0; start < sequence; start += projection_chunk_size) {
+                const int64_t end = std::min(start + projection_chunk_size, sequence);
+                auto projected = out_proj->forward(ctx,
+                                                   ggml_ext_slice(ctx->ggml_ctx,
+                                                                  out,
+                                                                  1,
+                                                                  start,
+                                                                  end));
+                ggml_format_name(projected,
+                                 "h3.sequence.attn.projected.%lld",
+                                 (long long) (start / projection_chunk_size));
+                projected_chunks.push_back(projected);
+            }
+            return concat_balanced(ctx->ggml_ctx, std::move(projected_chunks), 1);
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx,
+                             ggml_tensor* x,
+                             ggml_tensor* pe = nullptr) {
+            if (chunk_size <= 0 || x->ne[1] <= chunk_size || !ctx->flash_attn_enabled) {
+                return forward_full(ctx, x, pe);
+            }
+            auto outputs = forward_chunks(
+                ctx,
+                x->ne[1],
+                x->ne[2] * x->ne[3],
+                pe,
+                [&](int64_t start, int64_t end) {
+                    return ggml_ext_slice(ctx->ggml_ctx, x, 1, start, end);
+                });
+            auto output = concat_balanced(ctx->ggml_ctx, std::move(outputs), 1);
+            ggml_set_name(output, "h3.attn.output");
+            return output;
         }
     };
 
@@ -242,8 +550,11 @@ namespace MiniMaxH3 {
             blocks["attn"]  = std::make_shared<Attention>(config.hidden_size,
                                                          config.num_attention_heads,
                                                          config.attention_head_dim,
-                                                         config.qk_norm_eps);
-            blocks["mlp"]   = std::make_shared<MLP>(config.hidden_size, config.ffn_hidden_size);
+                                                         config.qk_norm_eps,
+                                                         config.attention_chunk_size);
+            blocks["mlp"]   = std::make_shared<MLP>(config.hidden_size,
+                                                      config.ffn_hidden_size,
+                                                      config.mlp_chunk_size);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
@@ -350,8 +661,37 @@ namespace MiniMaxH3 {
                                                 projection,
                                                 hidden_size * expand,
                                                 timestep_rows * modalities);
-        auto selected         = ggml_ext_slice(ctx, reshaped, 1, row, row + 1);
-        return ggml_ext_chunk(ctx, selected, expand, 0);
+        auto selected         = ggml_ext_slice(ctx, reshaped, 1, row, row + 1, false);
+        GGML_ASSERT(ggml_is_contiguous(selected));
+        auto chunks = ggml_ext_chunk(ctx, selected, expand, 0, false);
+        for (const auto * chunk : chunks) {
+            GGML_ASSERT(ggml_is_contiguous(chunk));
+        }
+        return chunks;
+    }
+
+    static std::vector<ggml_tensor*> sequence_modulation(ggml_context* ctx,
+                                                         ggml_tensor* projection,
+                                                         ggml_tensor* indices,
+                                                         int64_t hidden_size,
+                                                         int expand,
+                                                         int modalities) {
+        const int64_t rows = projection->ne[1] * modalities;
+        GGML_ASSERT(ggml_is_contiguous(projection));
+        std::vector<ggml_tensor*> result;
+        result.reserve(expand);
+        for (int i = 0; i < expand; ++i) {
+            auto table = ggml_view_2d(ctx,
+                                      projection,
+                                      hidden_size,
+                                      rows,
+                                      hidden_size * expand * projection->nb[0],
+                                      i * hidden_size * projection->nb[0]);
+            auto values = ggml_get_rows(ctx, table, indices);
+            ggml_format_name(values, "h3.sequence.modulation.%d", i);
+            result.push_back(values);
+        }
+        return result;
     }
 
     static ggml_tensor* modulate_segments(ggml_context* ctx,
@@ -371,10 +711,10 @@ namespace MiniMaxH3 {
                                        expand,
                                        modalities,
                                        segment.modulation_row);
-            auto part = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
-            part      = ggml_add(ctx,
-                                 ggml_add(ctx, part, ggml_mul(ctx, part, mods[scale_index])),
-                                 mods[shift_index]);
+            auto input = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
+            auto part  = ggml_mul(ctx, input, mods[scale_index]);
+            part       = ggml_add_inplace(ctx, part, input);
+            part       = ggml_add_inplace(ctx, part, mods[shift_index]);
             out       = out == nullptr ? part : ggml_concat(ctx, out, part, 1);
         }
         return out;
@@ -392,10 +732,104 @@ namespace MiniMaxH3 {
             auto mods = modulation_row(ctx, projection, hidden_size, 6, 3, segment.modulation_row);
             auto base = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
             auto add  = ggml_ext_slice(ctx, update, 1, segment.start, segment.end);
-            auto part = ggml_add(ctx, base, ggml_mul(ctx, add, mods[gate_index]));
+            auto part = ggml_mul(ctx, add, mods[gate_index]);
+            part      = ggml_add_inplace(ctx, part, base);
             out       = out == nullptr ? part : ggml_concat(ctx, out, part, 1);
         }
         return out;
+    }
+
+    static ggml_tensor* normalized_modulated_range(
+        GGMLRunnerContext* ctx,
+        const std::shared_ptr<RMSNorm>& norm,
+        ggml_tensor* x,
+        int64_t x_start,
+        int64_t start,
+        int64_t end,
+        ggml_tensor* projection,
+        const std::vector<TokenModulationSpan>& segments,
+        int64_t hidden_size,
+        int shift_index,
+        int scale_index) {
+        std::vector<ggml_tensor*> outputs;
+        for (const auto& segment : segments) {
+            int64_t part_start = std::max(start, segment.start);
+            int64_t part_end   = std::min(end, segment.end);
+            if (part_start >= part_end) {
+                continue;
+            }
+            auto input = ggml_ext_slice(ctx->ggml_ctx,
+                                        x,
+                                        1,
+                                        part_start - x_start,
+                                        part_end - x_start,
+                                        false);
+            if (input->type != GGML_TYPE_F32) {
+                input = ggml_cast(ctx->ggml_ctx, input, GGML_TYPE_F32);
+            }
+            input     = norm->forward(ctx, input);
+            auto mods = modulation_row(ctx->ggml_ctx,
+                                       projection,
+                                       hidden_size,
+                                       6,
+                                       3,
+                                       segment.modulation_row);
+            auto output = ggml_mul(ctx->ggml_ctx, input, mods[scale_index]);
+            output      = ggml_add_inplace(ctx->ggml_ctx, output, input);
+            output      = ggml_add_inplace(ctx->ggml_ctx, output, mods[shift_index]);
+            outputs.push_back(output);
+        }
+        GGML_ASSERT(!outputs.empty());
+        return outputs.size() == 1 ? outputs.front()
+                                   : concat_balanced(ctx->ggml_ctx, std::move(outputs), 1);
+    }
+
+    static ggml_tensor* gated_residual_range(
+        GGMLRunnerContext* ctx,
+        ggml_tensor* x,
+        int64_t x_start,
+        ggml_tensor* update,
+        int64_t start,
+        int64_t end,
+        ggml_tensor* projection,
+        const std::vector<TokenModulationSpan>& segments,
+        int64_t hidden_size,
+        int gate_index) {
+        std::vector<ggml_tensor*> outputs;
+        for (const auto& segment : segments) {
+            int64_t part_start = std::max(start, segment.start);
+            int64_t part_end   = std::min(end, segment.end);
+            if (part_start >= part_end) {
+                continue;
+            }
+            auto base = ggml_ext_slice(ctx->ggml_ctx,
+                                       x,
+                                       1,
+                                       part_start - x_start,
+                                       part_end - x_start,
+                                       false);
+            if (base->type != GGML_TYPE_F32) {
+                base = ggml_cast(ctx->ggml_ctx, base, GGML_TYPE_F32);
+            }
+            auto add = ggml_ext_slice(ctx->ggml_ctx,
+                                      update,
+                                      1,
+                                      part_start - start,
+                                      part_end - start,
+                                      false);
+            auto mods = modulation_row(ctx->ggml_ctx,
+                                       projection,
+                                       hidden_size,
+                                       6,
+                                       3,
+                                       segment.modulation_row);
+            auto output = ggml_mul(ctx->ggml_ctx, add, mods[gate_index]);
+            output      = ggml_add_inplace(ctx->ggml_ctx, output, base);
+            outputs.push_back(output);
+        }
+        GGML_ASSERT(!outputs.empty());
+        return outputs.size() == 1 ? outputs.front()
+                                   : concat_balanced(ctx->ggml_ctx, std::move(outputs), 1);
     }
 
     struct TransformerBlock : public GGMLBlock {
@@ -408,9 +842,12 @@ namespace MiniMaxH3 {
             blocks["attn"]       = std::make_shared<Attention>(config.hidden_size,
                                                          config.num_attention_heads,
                                                          config.attention_head_dim,
-                                                         config.qk_norm_eps);
+                                                         config.qk_norm_eps,
+                                                         config.attention_chunk_size,
+                                                         config.attention_sparsity);
             blocks["mlp"]        = std::make_shared<MLP>(config.hidden_size,
-                                                  config.ffn_hidden_size);
+                                                           config.ffn_hidden_size,
+                                                           config.mlp_chunk_size);
             blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
                                                                             config.hidden_size,
                                                                             6,
@@ -419,11 +856,16 @@ namespace MiniMaxH3 {
                                                                             config.uses_adaln_curves());
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx,
-                             ggml_tensor* x,
-                             ggml_tensor* t_emb,
-                             const std::vector<TokenModulationSpan>& segments,
-                             ggml_tensor* pe) {
+        void set_attention_sparsity(float value) {
+            config.attention_sparsity = value;
+            std::dynamic_pointer_cast<Attention>(blocks["attn"])->set_sparsity(value);
+        }
+
+        ggml_tensor* forward_chunked(GGMLRunnerContext* ctx,
+                                     ggml_tensor* x,
+                                     ggml_tensor* t_emb,
+                                     const std::vector<TokenModulationSpan>& segments,
+                                     ggml_tensor* pe) {
             auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
             auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
             auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
@@ -431,8 +873,220 @@ namespace MiniMaxH3 {
             auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
             auto mods  = adaln->forward(ctx, t_emb);
 
+            int64_t sequence = x->ne[1];
+            auto attention_outputs = attn->forward_chunks(
+                ctx,
+                sequence,
+                x->ne[2] * x->ne[3],
+                pe,
+                [&](int64_t start, int64_t end) {
+                    return normalized_modulated_range(ctx,
+                                                      norm1,
+                                                      x,
+                                                      0,
+                                                      start,
+                                                      end,
+                                                      mods,
+                                                      segments,
+                                                      config.hidden_size,
+                                                      0,
+                                                      1);
+                });
+
+            std::vector<ggml_tensor*> outputs;
+            outputs.reserve(attention_outputs.size());
+            size_t chunk_index = 0;
+            for (int64_t start = 0; start < sequence; start += attn->chunk_size, ++chunk_index) {
+                int64_t end = std::min(start + attn->chunk_size, sequence);
+                auto residual = gated_residual_range(ctx,
+                                                     x,
+                                                     0,
+                                                     attention_outputs[chunk_index],
+                                                     start,
+                                                     end,
+                                                     mods,
+                                                     segments,
+                                                     config.hidden_size,
+                                                     2);
+                if (config.activation_storage_type != GGML_TYPE_F32) {
+                    residual = ggml_cast(ctx->ggml_ctx,
+                                         residual,
+                                         config.activation_storage_type);
+                }
+                auto h = normalized_modulated_range(ctx,
+                                                    norm2,
+                                                    residual,
+                                                    start,
+                                                    start,
+                                                    end,
+                                                    mods,
+                                                    segments,
+                                                    config.hidden_size,
+                                                    3,
+                                                    4);
+                auto output = gated_residual_range(ctx,
+                                                   residual,
+                                                   start,
+                                                   mlp->forward(ctx, h),
+                                                   start,
+                                                   end,
+                                                   mods,
+                                                   segments,
+                                                   config.hidden_size,
+                                                   5);
+                if (config.activation_storage_type != GGML_TYPE_F32) {
+                    output = ggml_cast(ctx->ggml_ctx,
+                                       output,
+                                       config.activation_storage_type);
+                }
+                ggml_format_name(output, "h3.block.output.%zu", chunk_index);
+                outputs.push_back(output);
+            }
+            auto output = concat_balanced(ctx->ggml_ctx, std::move(outputs), 1);
+            ggml_set_name(output, "h3.block.output");
+            return output;
+        }
+
+        ggml_tensor* forward_sequence_parallel(GGMLRunnerContext* ctx,
+                                               ggml_tensor* x,
+                                               ggml_tensor* t_emb,
+                                               const std::vector<TokenModulationSpan>& segments,
+                                               ggml_tensor* modulation_indices,
+                                               ggml_tensor* pe,
+                                               const std::string& attention_cut_group) {
+            GGML_ASSERT(modulation_indices != nullptr);
+            ggml_tensor* residual_input = x;
+            if (x->type != GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
+            auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
+            auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
+            auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
+            auto mlp   = std::dynamic_pointer_cast<MLP>(blocks["mlp"]);
+            auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
+            auto projection = adaln->forward(ctx, t_emb);
+            const std::string qkv_cut_group = attention_cut_group.empty()
+                                                  ? std::string()
+                                                  : attention_cut_group + ".qkv";
+            if (!qkv_cut_group.empty()) {
+                sd::ggml_graph_cut::mark_graph_cut(projection,
+                                                   qkv_cut_group,
+                                                   "adaln_projection");
+                residual_input = ggml_dup(ctx->ggml_ctx, residual_input);
+                ggml_set_name(residual_input, "h3.sequence.block.residual_input");
+                sd::ggml_graph_cut::mark_graph_cut(residual_input,
+                                                   qkv_cut_group,
+                                                   "residual_input");
+            }
+            auto mods = sequence_modulation(ctx->ggml_ctx,
+                                            projection,
+                                            modulation_indices,
+                                            config.hidden_size,
+                                            6,
+                                            3);
+            auto cast_like = [&](ggml_tensor* value, const ggml_tensor* reference) {
+                return value->type == reference->type
+                           ? value
+                           : ggml_cast(ctx->ggml_ctx, value, reference->type);
+            };
+
+            auto normalized = norm1->forward_out_of_place(ctx, x);
+            auto shift1 = cast_like(mods[0], normalized);
+            auto scale1 = cast_like(mods[1], normalized);
+            auto h = ggml_add(ctx->ggml_ctx,
+                              shift1,
+                              ggml_add(ctx->ggml_ctx,
+                                       ggml_mul(ctx->ggml_ctx, scale1, normalized),
+                                       normalized));
+            ggml_set_name(h, "h3.sequence.block.modulated1");
+
+            auto attn_output = attn->forward_sequence_parallel(ctx,
+                                                               h,
+                                                               pe,
+                                                               config.activation_storage_type,
+                                                               qkv_cut_group);
+            auto gate1 = cast_like(mods[2], attn_output);
+            if (residual_input->type != GGML_TYPE_F32) {
+                residual_input = ggml_cast(ctx->ggml_ctx,
+                                           residual_input,
+                                           GGML_TYPE_F32);
+            }
+            auto residual = ggml_add(ctx->ggml_ctx,
+                                     residual_input,
+                                     ggml_mul(ctx->ggml_ctx, attn_output, gate1));
+            if (config.activation_storage_type != GGML_TYPE_F32) {
+                residual = ggml_cast(ctx->ggml_ctx,
+                                     residual,
+                                     config.activation_storage_type);
+            }
+            ggml_set_name(residual, "h3.sequence.block.residual1");
+            if (!attention_cut_group.empty()) {
+                sd::ggml_graph_cut::mark_graph_cut(residual,
+                                                   attention_cut_group,
+                                                   "hidden_states");
+            }
+
+            auto residual_for_mlp = residual;
+            if (residual_for_mlp->type != GGML_TYPE_F32) {
+                residual_for_mlp = ggml_cast(ctx->ggml_ctx,
+                                             residual_for_mlp,
+                                             GGML_TYPE_F32);
+            }
+            normalized = norm2->forward_out_of_place(ctx, residual_for_mlp);
+            auto shift2 = cast_like(mods[3], normalized);
+            auto scale2 = cast_like(mods[4], normalized);
+            h = ggml_add(ctx->ggml_ctx,
+                         shift2,
+                         ggml_add(ctx->ggml_ctx,
+                                  ggml_mul(ctx->ggml_ctx, scale2, normalized),
+                                  normalized));
+            ggml_set_name(h, "h3.sequence.block.modulated2");
+
+            auto mlp_output = mlp->forward(ctx, h);
+            auto gate2 = cast_like(mods[5], mlp_output);
+            auto output = ggml_add(ctx->ggml_ctx,
+                                   residual_for_mlp,
+                                   ggml_mul(ctx->ggml_ctx, mlp_output, gate2));
+            if (config.activation_storage_type != GGML_TYPE_F32) {
+                output = ggml_cast(ctx->ggml_ctx, output, config.activation_storage_type);
+            }
+            ggml_set_name(output, "h3.sequence.block.output");
+            return output;
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx,
+                             ggml_tensor* x,
+                             ggml_tensor* t_emb,
+                             const std::vector<TokenModulationSpan>& segments,
+                             ggml_tensor* pe,
+                             ggml_tensor* modulation_indices = nullptr,
+                             const std::string& attention_cut_group = "") {
+            if (config.sequence_parallel) {
+                return forward_sequence_parallel(ctx,
+                                                 x,
+                                                 t_emb,
+                                                 segments,
+                                                 modulation_indices,
+                                                 pe,
+                                                 attention_cut_group);
+            }
+            auto attn = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
+            if (attn->chunk_size > 0 && x->ne[1] > attn->chunk_size && ctx->flash_attn_enabled) {
+                return forward_chunked(ctx, x, t_emb, segments, pe);
+            }
+            if (x->type != GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
+            auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
+            auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
+            auto mlp   = std::dynamic_pointer_cast<MLP>(blocks["mlp"]);
+            auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
+            auto mods  = adaln->forward(ctx, t_emb);
+
+            auto normalized = norm1->forward(ctx, x);
+            ggml_set_name(normalized, "h3.block.norm1");
             auto h = modulate_segments(ctx->ggml_ctx,
-                                       norm1->forward(ctx, x),
+                                       normalized,
                                        mods,
                                        segments,
                                        config.hidden_size,
@@ -440,6 +1094,7 @@ namespace MiniMaxH3 {
                                        3,
                                        0,
                                        1);
+            ggml_set_name(h, "h3.block.modulated1");
             x      = gated_residual_segments(ctx->ggml_ctx,
                                              x,
                                              attn->forward(ctx, h, pe),
@@ -447,8 +1102,11 @@ namespace MiniMaxH3 {
                                              segments,
                                              config.hidden_size,
                                              2);
+            ggml_set_name(x, "h3.block.residual1");
+            normalized = norm2->forward(ctx, x);
+            ggml_set_name(normalized, "h3.block.norm2");
             h      = modulate_segments(ctx->ggml_ctx,
-                                       norm2->forward(ctx, x),
+                                       normalized,
                                        mods,
                                        segments,
                                        config.hidden_size,
@@ -456,13 +1114,21 @@ namespace MiniMaxH3 {
                                        3,
                                        3,
                                        4);
-            return gated_residual_segments(ctx->ggml_ctx,
-                                           x,
-                                           mlp->forward(ctx, h),
-                                           mods,
-                                           segments,
-                                           config.hidden_size,
-                                           5);
+            ggml_set_name(h, "h3.block.modulated2");
+            auto output = gated_residual_segments(ctx->ggml_ctx,
+                                                  x,
+                                                  mlp->forward(ctx, h),
+                                                  mods,
+                                                  segments,
+                                                  config.hidden_size,
+                                                  5);
+            if (config.activation_storage_type != GGML_TYPE_F32) {
+                output = ggml_cast(ctx->ggml_ctx,
+                                   output,
+                                   config.activation_storage_type);
+            }
+            ggml_set_name(output, "h3.block.output");
+            return output;
         }
     };
 
@@ -524,6 +1190,14 @@ namespace MiniMaxH3 {
                 blocks["blocks." + std::to_string(i)] = std::make_shared<TransformerBlock>(config);
             }
             blocks["final_layer"] = std::make_shared<FinalLayer>(config);
+        }
+
+        void set_attention_sparsity(float value) {
+            config.attention_sparsity = value;
+            for (int64_t i = 0; i < config.num_layers; ++i) {
+                auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
+                block->set_attention_sparsity(value);
+            }
         }
 
         void init_params(ggml_context* ctx,
@@ -606,6 +1280,7 @@ namespace MiniMaxH3 {
                                                       const std::vector<ggml_tensor*>& condition_videos,
                                                       const std::vector<ggml_tensor*>& condition_audios,
                                                       ggml_tensor* position_ids,
+                                                      ggml_tensor* modulation_indices,
                                                       ggml_tensor* timestep_features,
                                                       ggml_tensor* curve_indices,
                                                       ggml_tensor* curve_upper_indices,
@@ -707,15 +1382,63 @@ namespace MiniMaxH3 {
                                         curve_upper_indices,
                                         curve_fractions);
             auto pe    = build_rope(ctx, position_ids);
-            for (int64_t i = 0; i < config.num_layers; ++i) {
+            if (config.activation_storage_type != GGML_TYPE_F32) {
+                h = ggml_cast(ctx->ggml_ctx, h, config.activation_storage_type);
+            }
+            if (config.sequence_parallel) {
+                GGML_ASSERT(modulation_indices != nullptr);
+                h = ggml_backend_meta_scatter(ctx->ggml_ctx,
+                                              ggml_cont(ctx->ggml_ctx, h),
+                                              GGML_BACKEND_SPLIT_AXIS_1);
+                modulation_indices = ggml_backend_meta_scatter(ctx->ggml_ctx,
+                                                               modulation_indices,
+                                                               GGML_BACKEND_SPLIT_AXIS_0);
+                ggml_set_name(h, "h3.sequence.hidden_states");
+                ggml_set_name(pe, "h3.sequence.rotary_embeddings");
+                ggml_set_name(modulation_indices, "h3.sequence.modulation_indices");
+            }
+            if (config.activation_storage_type != GGML_TYPE_F32 || config.sequence_parallel) {
+                ggml_set_name(h, "h3.block.input");
+                sd::ggml_graph_cut::mark_graph_cut(h,
+                                                   "minimax_h3.input_pack",
+                                                   "hidden_states");
+                if (config.sequence_parallel) {
+                    sd::ggml_graph_cut::mark_graph_cut(pe,
+                                                       "minimax_h3.input_pack",
+                                                       "rotary_embeddings");
+                    sd::ggml_graph_cut::mark_graph_cut(modulation_indices,
+                                                       "minimax_h3.input_pack",
+                                                       "modulation_indices");
+                    sd::ggml_graph_cut::mark_graph_cut(t_emb,
+                                                       "minimax_h3.input_pack",
+                                                       "timestep_embedding");
+                }
+            }
+            for (int64_t i = 0; i < config.execution_layers; ++i) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
-                h          = block->forward(ctx, h, t_emb, segments, pe);
+                h          = block->forward(ctx,
+                                            h,
+                                            t_emb,
+                                            segments,
+                                            pe,
+                                            modulation_indices,
+                                            "minimax_h3.blocks." + std::to_string(i) + ".attention");
                 sd::ggml_graph_cut::mark_graph_cut(h,
                                                    "minimax_h3.blocks." + std::to_string(i),
                                                    "hidden_states");
             }
 
+            if (config.sequence_parallel) {
+                h = ggml_backend_meta_all_gather(ctx->ggml_ctx,
+                                                 ggml_cont(ctx->ggml_ctx, h),
+                                                 GGML_BACKEND_SPLIT_AXIS_1);
+                ggml_set_name(h, "h3.sequence.hidden_states.gathered");
+            }
+
             auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
+            if (h->type != GGML_TYPE_F32) {
+                h = ggml_cast(ctx->ggml_ctx, h, GGML_TYPE_F32);
+            }
             auto output      = final_layer->forward(ctx, h, t_emb, video_segment, audio_segment);
             auto video_out   = DiT::unpatchify_3d(ctx->ggml_ctx,
                                                   output.first,
@@ -971,6 +1694,10 @@ namespace MiniMaxH3 {
     }
 
     struct MiniMaxH3Runner : public DiffusionModelRunner {
+        size_t get_compute_context_tensor_capacity() const override {
+            return H3_TENSOR_CAPACITY;
+        }
+
         struct RefinedContextCacheEntry {
             const void* context_cache_identity            = nullptr;
             const sd::Tensor<float>* source_context       = nullptr;
@@ -1012,24 +1739,139 @@ namespace MiniMaxH3 {
         sd::Tensor<float> video_input_cache;
         sd::Tensor<float> audio_input_cache;
         sd::Tensor<float> position_input_cache;
+        sd::Tensor<int32_t> modulation_index_input_cache;
         sd::Tensor<float> timestep_feature_input_cache;
         sd::Tensor<int32_t> curve_index_input_cache;
         sd::Tensor<int32_t> curve_upper_index_input_cache;
         sd::Tensor<float> curve_fraction_input_cache;
         std::vector<std::unique_ptr<RefinedContextCacheEntry>> refined_context_cache;
 
+        static Config configure(const String2TensorStorage& tensors,
+                                const std::string& prefix,
+                                const char* model_args,
+                                bool sequence_parallel) {
+            Config config = Config::detect_from_weights(tensors, prefix);
+            config.sequence_parallel = sequence_parallel;
+            for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
+                if (key == "minimax_h3_attention_sparsity") {
+                    float parsed = 0.0f;
+                    if (!parse_strict_float(value, parsed) || !std::isfinite(parsed) || parsed < 0.0f || parsed >= 1.0f) {
+                        LOG_WARN("ignoring invalid MiniMax-H3 model arg '%s=%s' (expected 0..less than 1)",
+                                 key.c_str(),
+                                 value.c_str());
+                        continue;
+                    }
+                    config.attention_sparsity = parsed;
+                    if (parsed > 0.0f) {
+                        LOG_INFO("MiniMax-H3 dynamic sparse attention enabled: %.1f%% sparsity (CUDA FlashAttention only)",
+                                 parsed * 100.0f);
+                    }
+                    continue;
+                }
+                if (key == "minimax_h3_mlp_chunk_size") {
+                    int parsed = 0;
+                    if (!parse_strict_int(value, parsed) || parsed < 0) {
+                        LOG_WARN("ignoring invalid MiniMax-H3 model arg '%s=%s' (expected >= 0)",
+                                 key.c_str(),
+                                 value.c_str());
+                        continue;
+                    }
+                    config.mlp_chunk_size = parsed;
+                    continue;
+                }
+                if (key == "minimax_h3_attention_chunk_size") {
+                    int parsed = 0;
+                    if (!parse_strict_int(value, parsed) ||
+                        (parsed != 0 && (parsed < 128 || parsed % 128 != 0))) {
+                        LOG_WARN("ignoring invalid MiniMax-H3 model arg '%s=%s' (expected 0 or a multiple of 128)",
+                                 key.c_str(),
+                                 value.c_str());
+                        continue;
+                    }
+                    config.attention_chunk_size = parsed;
+                    continue;
+                }
+                if (key == "minimax_h3_activation_storage") {
+                    if (value == "f32") {
+                        config.activation_storage_type = GGML_TYPE_F32;
+                    } else if (value == "bf16") {
+                        config.activation_storage_type = GGML_TYPE_BF16;
+                    } else if (value == "f16") {
+                        config.activation_storage_type = GGML_TYPE_F16;
+                    } else {
+                        LOG_WARN("ignoring invalid MiniMax-H3 model arg '%s=%s' (expected f32, bf16, or f16)",
+                                 key.c_str(),
+                                 value.c_str());
+                    }
+                    continue;
+                }
+                if (key != "minimax_h3_layer_limit") {
+                    continue;
+                }
+                int parsed = 0;
+                if (!parse_strict_int(value, parsed) || parsed < 1 || parsed > config.num_layers) {
+                    LOG_WARN("ignoring invalid MiniMax-H3 model arg '%s=%s' (expected 1..%" PRId64 ")",
+                             key.c_str(),
+                             value.c_str(),
+                             config.num_layers);
+                    continue;
+                }
+                config.execution_layers = parsed;
+                if (config.execution_layers < config.num_layers) {
+                    LOG_WARN("MiniMax-H3 benchmark layer limit is active: executing %" PRId64
+                             "/%" PRId64 " transformer blocks; output quality is not representative",
+                             config.execution_layers,
+                             config.num_layers);
+                }
+            }
+            if (config.mlp_chunk_size > 0) {
+                LOG_INFO("MiniMax-H3 MLP token chunking enabled: chunk=%" PRId64,
+                         config.mlp_chunk_size);
+            }
+            if (config.attention_chunk_size > 0) {
+                LOG_INFO("MiniMax-H3 attention token chunking enabled: chunk=%" PRId64,
+                         config.attention_chunk_size);
+            }
+            LOG_INFO("MiniMax-H3 activation storage: %s",
+                     ggml_type_name(config.activation_storage_type));
+            return config;
+        }
+
         MiniMaxH3Runner(ggml_backend_t backend,
                         const String2TensorStorage& tensors,
                         const std::string& prefix                           = "model.diffusion_model",
-                        std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+                        std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                        const char* model_args                              = nullptr,
+                        bool sequence_parallel                              = false)
             : DiffusionModelRunner(backend, prefix, weight_manager),
-              config(Config::detect_from_weights(tensors, prefix)),
+              config(configure(tensors, prefix, model_args, sequence_parallel)),
               model(config) {
             model.init(params_ctx, tensors, prefix);
         }
 
         std::string get_desc() override {
             return "minimax_h3";
+        }
+
+        bool reuse_compute_buffer_between_segments() const override {
+            return true;
+        }
+
+        bool get_attention_sparsity(float* sparsity) const override {
+            if (sparsity == nullptr) {
+                return false;
+            }
+            *sparsity = config.attention_sparsity;
+            return true;
+        }
+
+        bool set_attention_sparsity(float sparsity) override {
+            if (!std::isfinite(sparsity) || sparsity < 0.0f || sparsity >= 1.0f) {
+                return false;
+            }
+            config.attention_sparsity = sparsity;
+            model.set_attention_sparsity(sparsity);
+            return true;
         }
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors,
@@ -1112,7 +1954,8 @@ namespace MiniMaxH3 {
                                                          false,
                                                          true,
                                                          true,
-                                                         true);
+                                                         true,
+                                                         CrossForwardPrefetch::DISABLED);
                 if (!result.has_value()) {
                     return nullptr;
                 }
@@ -1223,6 +2066,20 @@ namespace MiniMaxH3 {
                 layout.positions);
             auto positions = make_input(position_input_cache);
 
+            std::vector<int32_t> modulation_indices(layout.positions.size() / 3, -1);
+            for (const auto& segment : layout.segments) {
+                GGML_ASSERT(segment.start >= 0 && segment.end <= static_cast<int64_t>(modulation_indices.size()));
+                std::fill(modulation_indices.begin() + segment.start,
+                          modulation_indices.begin() + segment.end,
+                          static_cast<int32_t>(segment.modulation_row));
+            }
+            GGML_ASSERT(std::find(modulation_indices.begin(), modulation_indices.end(), -1) ==
+                        modulation_indices.end());
+            modulation_index_input_cache = sd::Tensor<int32_t>(
+                {static_cast<int64_t>(modulation_indices.size())},
+                modulation_indices);
+            auto modulation_index_input = make_input(modulation_index_input_cache);
+
             ggml_tensor* timestep_features   = nullptr;
             ggml_tensor* curve_indices       = nullptr;
             ggml_tensor* curve_upper_indices = nullptr;
@@ -1270,6 +2127,7 @@ namespace MiniMaxH3 {
                                             condition_inputs,
                                             audio_condition_inputs,
                                             positions,
+                                            modulation_index_input,
                                             timestep_features,
                                             curve_indices,
                                             curve_upper_indices,

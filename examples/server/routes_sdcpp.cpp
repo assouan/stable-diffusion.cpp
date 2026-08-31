@@ -185,7 +185,7 @@ static json make_img_gen_features_json() {
     };
 }
 
-static json make_vid_gen_features_json() {
+static json make_vid_gen_features_json(bool supports_attention_sparsity) {
     return {
         {"init_image", true},
         {"end_image", true},
@@ -194,6 +194,10 @@ static json make_vid_gen_features_json() {
         {"lora", true},
         {"vae_tiling", true},
         {"cache", true},
+        {"artifacts", true},
+        {"model_options", {
+                              {"minimax_h3_attention_sparsity", supports_attention_sparsity},
+                          }},
         {"cancel_queued", true},
         {"cancel_generating", false},
     };
@@ -300,7 +304,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     if (supports_vid) {
         defaults_by_mode["vid_gen"]       = make_vid_gen_defaults_json(defaults, default_vid_output_format);
         output_formats_by_mode["vid_gen"] = video_output_formats;
-        features_by_mode["vid_gen"]       = make_vid_gen_features_json();
+        features_by_mode["vid_gen"]       = make_vid_gen_features_json(runtime.supports_attention_sparsity);
     }
 
     json top_level_defaults       = json::object();
@@ -390,6 +394,151 @@ static bool parse_vid_gen_request(const json& body,
         })) {
         error_message = "invalid generation parameters";
         return false;
+    }
+
+    auto model_options_it = body.find("model_options");
+    if (model_options_it != body.end()) {
+        if (!model_options_it->is_object()) {
+            error_message = "model_options must be an object";
+            return false;
+        }
+        for (const auto& item : model_options_it->items()) {
+            if (item.key() != "minimax_h3_attention_sparsity") {
+                error_message = "unsupported model option: " + item.key();
+                return false;
+            }
+        }
+
+        auto sparsity_it = model_options_it->find("minimax_h3_attention_sparsity");
+        if (sparsity_it != model_options_it->end()) {
+            if (!runtime.supports_attention_sparsity) {
+                error_message = "loaded model does not support attention sparsity overrides";
+                return false;
+            }
+            if (!sparsity_it->is_number()) {
+                error_message = "model_options.minimax_h3_attention_sparsity must be a number";
+                return false;
+            }
+            double sparsity = sparsity_it->get<double>();
+            if (!std::isfinite(sparsity) || sparsity < 0.0 || sparsity >= 1.0) {
+                error_message = "model_options.minimax_h3_attention_sparsity must be in [0, 1)";
+                return false;
+            }
+            request.has_minimax_h3_attention_sparsity = true;
+            request.minimax_h3_attention_sparsity     = static_cast<float>(sparsity);
+        }
+    }
+
+    auto artifacts_it = body.find("artifacts");
+    if (artifacts_it != body.end()) {
+        if (!artifacts_it->is_object()) {
+            error_message = "artifacts must be an object";
+            return false;
+        }
+        static const std::vector<std::string> artifact_keys = {
+            "save_conditioning",
+            "conditioning_only",
+            "save_latent",
+            "latent_only",
+            "conditioning_input",
+            "latent_input",
+        };
+        for (const auto& item : artifacts_it->items()) {
+            if (std::find(artifact_keys.begin(), artifact_keys.end(), item.key()) == artifact_keys.end()) {
+                error_message = "unsupported artifact option: " + item.key();
+                return false;
+            }
+        }
+
+        auto read_save_flag = [&](const char* key, bool* value) {
+            auto it = artifacts_it->find(key);
+            if (it == artifacts_it->end()) {
+                return true;
+            }
+            if (!it->is_boolean()) {
+                error_message = std::string("artifacts.") + key + " must be a boolean";
+                return false;
+            }
+            *value = it->get<bool>();
+            return true;
+        };
+        if (!read_save_flag("save_conditioning", &request.save_conditioning) ||
+            !read_save_flag("conditioning_only", &request.conditioning_only) ||
+            !read_save_flag("save_latent", &request.save_latent) ||
+            !read_save_flag("latent_only", &request.latent_only)) {
+            return false;
+        }
+
+        fs::path artifact_directory;
+        const bool has_artifact_option = request.save_conditioning || request.save_latent ||
+                                         request.conditioning_only || request.latent_only ||
+                                         artifacts_it->contains("conditioning_input") ||
+                                         artifacts_it->contains("latent_input");
+        if (has_artifact_option) {
+            if (runtime.svr_params->output_dir.empty()) {
+                error_message = "artifacts require a persistent server output directory";
+                return false;
+            }
+            artifact_directory = fs::path(runtime.svr_params->output_dir) / "artifacts";
+            std::error_code ec;
+            fs::create_directories(artifact_directory, ec);
+            if (ec) {
+                error_message = "unable to create the artifact output directory";
+                return false;
+            }
+        }
+
+        auto resolve_input = [&](const char* key, std::string* output_path) {
+            auto it = artifacts_it->find(key);
+            if (it == artifacts_it->end()) {
+                return true;
+            }
+            if (!it->is_string()) {
+                error_message = std::string("artifacts.") + key + " must be a file name";
+                return false;
+            }
+            fs::path file_name(it->get<std::string>());
+            if (file_name.empty() || file_name.has_parent_path() || file_name.filename() != file_name ||
+                file_name.extension() != ".safetensors") {
+                error_message = std::string("artifacts.") + key +
+                                " must name a .safetensors file from the artifact directory";
+                return false;
+            }
+            fs::path resolved = artifact_directory / file_name;
+            std::error_code ec;
+            if (!fs::is_regular_file(resolved, ec) || ec) {
+                error_message = "artifact input file does not exist: " + file_name.u8string();
+                return false;
+            }
+            *output_path = resolved.lexically_normal().u8string();
+            return true;
+        };
+        if (!resolve_input("conditioning_input", &request.conditioning_input_path) ||
+            !resolve_input("latent_input", &request.latent_input_path)) {
+            return false;
+        }
+        if (!request.latent_input_path.empty() &&
+            (!request.conditioning_input_path.empty() || request.save_conditioning || request.save_latent)) {
+            error_message = "latent_input cannot be combined with other artifact options";
+            return false;
+        }
+        if (!request.conditioning_input_path.empty() && request.save_conditioning) {
+            error_message = "conditioning_input cannot be combined with save_conditioning";
+            return false;
+        }
+        if (request.conditioning_only &&
+            (!request.save_conditioning || request.save_latent ||
+             request.latent_only || !request.conditioning_input_path.empty() ||
+             !request.latent_input_path.empty())) {
+            error_message = "conditioning_only requires save_conditioning and cannot be combined with other artifact operations";
+            return false;
+        }
+        if (request.latent_only &&
+            (!request.save_latent || request.save_conditioning ||
+             !request.latent_input_path.empty())) {
+            error_message = "latent_only requires save_latent and cannot load a latent or save conditioning";
+            return false;
+        }
     }
 
     std::string output_format = body.value("output_format", "webm");
@@ -512,7 +661,22 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     res.set_content(R"({"error":"job queue is full"})", "application/json");
                     return;
                 }
-                job->id               = make_async_job_id(manager);
+                job->id = make_async_job_id(manager);
+                fs::path artifact_directory = fs::path(runtime->svr_params->output_dir) / "artifacts";
+                if (job->vid_gen.save_conditioning) {
+                    fs::path file_name = job->id + ".conditioning.safetensors";
+                    job->vid_gen.conditioning_output_path =
+                        (artifact_directory / file_name).lexically_normal().u8string();
+                    job->vid_gen.conditioning_output_file_name =
+                        (fs::path("artifacts") / file_name).generic_u8string();
+                }
+                if (job->vid_gen.save_latent) {
+                    fs::path file_name = job->id + ".latent.safetensors";
+                    job->vid_gen.latent_output_path =
+                        (artifact_directory / file_name).lexically_normal().u8string();
+                    job->vid_gen.latent_output_file_name =
+                        (fs::path("artifacts") / file_name).generic_u8string();
+                }
                 manager.jobs[job->id] = job;
                 manager.queue.push_back(job->id);
             }
@@ -535,6 +699,58 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             res.status = 500;
             res.set_content(json({{"error", "server_error"}, {"message", e.what()}}).dump(), "application/json");
         }
+    });
+
+    svr.Get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/result)", [runtime](const httplib::Request& req, httplib::Response& res) {
+        AsyncJobManager& manager = *runtime->async_job_manager;
+        std::string media_path;
+        std::string media_file_name;
+        std::string media_mime_type;
+
+        {
+            std::lock_guard<std::mutex> lock(manager.mutex);
+            purge_expired_jobs(manager);
+
+            std::string job_id = req.matches[1];
+            auto it            = manager.jobs.find(job_id);
+            if (it == manager.jobs.end()) {
+                if (manager.expired_jobs.find(job_id) != manager.expired_jobs.end()) {
+                    res.status = 410;
+                    res.set_content(R"({"error":"job expired"})", "application/json");
+                } else {
+                    res.status = 404;
+                    res.set_content(R"({"error":"job not found"})", "application/json");
+                }
+                return;
+            }
+
+            const auto& job = *it->second;
+            if (job.status != AsyncJobStatus::Completed) {
+                res.status = 409;
+                res.set_content(R"({"error":"job is not completed"})", "application/json");
+                return;
+            }
+            if (job.kind != AsyncJobKind::VidGen || job.result_media_path.empty()) {
+                res.status = 404;
+                res.set_content(R"({"error":"persisted video result is not available"})", "application/json");
+                return;
+            }
+
+            media_path      = job.result_media_path;
+            media_file_name = job.result_media_file_name;
+            media_mime_type = job.result_media_mime_type;
+        }
+
+        std::error_code ec;
+        if (!fs::is_regular_file(media_path, ec)) {
+            res.status = 404;
+            res.set_content(R"({"error":"persisted video result is missing"})", "application/json");
+            return;
+        }
+
+        res.status = 200;
+        res.set_header("Content-Disposition", "attachment; filename=\"" + media_file_name + "\"");
+        res.set_file_content(media_path, media_mime_type);
     });
 
     svr.Get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+))", [runtime](const httplib::Request& req, httplib::Response& res) {

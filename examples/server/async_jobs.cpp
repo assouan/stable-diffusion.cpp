@@ -3,12 +3,16 @@
 #include "async_jobs.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 
 #include "common/log.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+
+namespace fs = std::filesystem;
 
 const char* async_job_kind_name(AsyncJobKind kind) {
     switch (kind) {
@@ -97,6 +101,8 @@ bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job) {
     job.completed_at = unix_timestamp_now();
     job.result_images_b64.clear();
     job.result_media_b64.clear();
+    job.result_media_path.clear();
+    job.result_media_file_name.clear();
     job.result_media_mime_type.clear();
     job.result_frame_count = 0;
     job.result_fps         = 0;
@@ -128,13 +134,32 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
 
     if (job.status == AsyncJobStatus::Completed) {
         if (job.kind == AsyncJobKind::VidGen) {
-            result["result"] = {
-                {"output_format", job.vid_gen.output_format},
-                {"mime_type", job.result_media_mime_type},
-                {"fps", job.result_fps},
-                {"frame_count", job.result_frame_count},
-                {"b64_json", job.result_media_b64},
-            };
+            if (job.vid_gen.conditioning_only || job.vid_gen.latent_only) {
+                result["result"] = json::object();
+            } else {
+                result["result"] = {
+                    {"output_format", job.vid_gen.output_format},
+                    {"mime_type", job.result_media_mime_type},
+                    {"fps", job.result_fps},
+                    {"frame_count", job.result_frame_count},
+                };
+                if (job.result_media_path.empty()) {
+                    result["result"]["b64_json"] = job.result_media_b64;
+                } else {
+                    result["result"]["file_name"]    = job.result_media_file_name;
+                    result["result"]["download_url"] = "/sdcpp/v1/jobs/" + job.id + "/result";
+                }
+            }
+            json artifacts = json::object();
+            if (!job.vid_gen.conditioning_output_file_name.empty()) {
+                artifacts["conditioning"] = job.vid_gen.conditioning_output_file_name;
+            }
+            if (!job.vid_gen.latent_output_file_name.empty()) {
+                artifacts["latent"] = job.vid_gen.latent_output_file_name;
+            }
+            if (!artifacts.empty()) {
+                result["result"]["artifacts"] = std::move(artifacts);
+            }
         } else {
             json images = json::array();
             for (size_t i = 0; i < job.result_images_b64.size(); ++i) {
@@ -229,26 +254,153 @@ bool execute_img_gen_job(ServerRuntime& runtime,
     return true;
 }
 
+static bool persist_video_output(const std::string& output_dir,
+                                 const std::string& job_id,
+                                 const std::string& output_format,
+                                 const std::vector<uint8_t>& bytes,
+                                 std::string& output_path,
+                                 std::string& output_file_name,
+                                 std::string& error_message) {
+    std::error_code ec;
+    fs::path final_path;
+    for (int suffix = 0; suffix < 1000; ++suffix) {
+        output_file_name = job_id;
+        if (suffix > 0) {
+            output_file_name += "-" + std::to_string(suffix);
+        }
+        output_file_name += "." + output_format;
+        final_path = fs::path(output_dir) / output_file_name;
+        const bool exists = fs::exists(final_path, ec);
+        if (ec) {
+            error_message = "unable to inspect persisted video output path";
+            return false;
+        }
+        if (!exists) {
+            break;
+        }
+        if (suffix == 999) {
+            error_message = "unable to select a unique persisted video path";
+            return false;
+        }
+    }
+
+    fs::path temporary_path = final_path;
+    temporary_path += ".tmp";
+    std::ofstream stream(temporary_path, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        error_message = "unable to open persisted video output";
+        return false;
+    }
+    stream.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    stream.close();
+    if (!stream) {
+        fs::remove(temporary_path, ec);
+        error_message = "unable to write persisted video output";
+        return false;
+    }
+
+    fs::rename(temporary_path, final_path, ec);
+    if (ec) {
+        fs::remove(temporary_path, ec);
+        error_message = "unable to publish persisted video output";
+        return false;
+    }
+    output_path = final_path.u8string();
+    return true;
+}
+
 bool execute_vid_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
                          std::string& output_media_b64,
+                         std::string& output_media_path,
+                         std::string& output_media_file_name,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,
                          std::string& error_message) {
     sd_vid_gen_params_t params = job.vid_gen.to_sd_vid_gen_params_t();
+    sd_vid_gen_artifact_params_t artifact_params;
+    sd_vid_gen_artifact_params_init(&artifact_params);
+    artifact_params.conditioning_input_path  = job.vid_gen.conditioning_input_path.empty()
+                                                   ? nullptr
+                                                   : job.vid_gen.conditioning_input_path.c_str();
+    artifact_params.conditioning_output_path = job.vid_gen.conditioning_output_path.empty()
+                                                   ? nullptr
+                                                   : job.vid_gen.conditioning_output_path.c_str();
+    artifact_params.latent_input_path        = job.vid_gen.latent_input_path.empty()
+                                                   ? nullptr
+                                                   : job.vid_gen.latent_input_path.c_str();
+    artifact_params.latent_output_path       = job.vid_gen.latent_output_path.empty()
+                                                   ? nullptr
+                                                   : job.vid_gen.latent_output_path.c_str();
 
     SDImageVec results;
-    int num_results             = 0;
-    sd_audio_t* generated_audio = nullptr;
+    int num_results                        = 0;
+    sd_audio_t* generated_audio            = nullptr;
+    bool attention_sparsity_restore_failed = false;
+    bool artifact_only_ok                  = true;
 
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
+        float previous_attention_sparsity = 0.0f;
+        bool restore_attention_sparsity   = false;
+        if (job.vid_gen.has_minimax_h3_attention_sparsity) {
+            if (!sd_ctx_get_attention_sparsity(runtime.sd_ctx, &previous_attention_sparsity) ||
+                !sd_ctx_set_attention_sparsity(runtime.sd_ctx,
+                                               job.vid_gen.minimax_h3_attention_sparsity)) {
+                error_message = "unable to apply attention sparsity override";
+                return false;
+            }
+            restore_attention_sparsity = true;
+            LOG_INFO("job %s: applying MiniMax-H3 attention sparsity %.1f%% (previous %.1f%%)",
+                     job.id.c_str(),
+                     job.vid_gen.minimax_h3_attention_sparsity * 100.0f,
+                     previous_attention_sparsity * 100.0f);
+        }
+
         sd_image_t* raw_results = nullptr;
-        if (!generate_video(runtime.sd_ctx, &params, &raw_results, &num_results, &generated_audio)) {
+        if (job.vid_gen.conditioning_only) {
+            artifact_only_ok = encode_video_conditioning(runtime.sd_ctx,
+                                                         &params,
+                                                         artifact_params.conditioning_output_path);
+        } else if (job.vid_gen.latent_only) {
+            artifact_only_ok = sample_video_latent(runtime.sd_ctx,
+                                                   &params,
+                                                   artifact_params.conditioning_input_path,
+                                                   artifact_params.latent_output_path);
+        } else if (!generate_video_with_artifacts(runtime.sd_ctx,
+                                                  &params,
+                                                  &artifact_params,
+                                                  &raw_results,
+                                                  &num_results,
+                                                  &generated_audio)) {
             raw_results = nullptr;
         }
         results.adopt(raw_results, num_results);
+
+        if (restore_attention_sparsity) {
+            attention_sparsity_restore_failed = !sd_ctx_set_attention_sparsity(runtime.sd_ctx,
+                                                                               previous_attention_sparsity);
+            if (!attention_sparsity_restore_failed) {
+                LOG_INFO("job %s: restored MiniMax-H3 attention sparsity to %.1f%%",
+                         job.id.c_str(),
+                         previous_attention_sparsity * 100.0f);
+            }
+        }
+    }
+
+    if (attention_sparsity_restore_failed) {
+        free_sd_audio(generated_audio);
+        error_message = "unable to restore attention sparsity after generation";
+        return false;
+    }
+    if (job.vid_gen.conditioning_only || job.vid_gen.latent_only) {
+        if (!artifact_only_ok) {
+            error_message = job.vid_gen.conditioning_only ? "conditioning encoding failed"
+                                                          : "latent sampling failed";
+        }
+        return artifact_only_ok;
     }
 
     num_results = results.count();
@@ -270,7 +422,17 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         return false;
     }
 
-    output_media_b64       = base64_encode(video_bytes);
+    if (runtime.svr_params->output_dir.empty()) {
+        output_media_b64 = base64_encode(video_bytes);
+    } else if (!persist_video_output(runtime.svr_params->output_dir,
+                                     job.id,
+                                     job.vid_gen.output_format,
+                                     video_bytes,
+                                     output_media_path,
+                                     output_media_file_name,
+                                     error_message)) {
+        return false;
+    }
     output_media_mime_type = video_mime_type(job.vid_gen.output_format);
     output_frame_count     = num_results;
     output_fps             = job.vid_gen.gen_params.fps;
@@ -310,6 +472,8 @@ void async_job_worker(ServerRuntime& runtime) {
 
         std::vector<std::string> output_images;
         std::string output_media_b64;
+        std::string output_media_path;
+        std::string output_media_file_name;
         std::string output_media_mime_type;
         int output_frame_count = 0;
         int output_fps         = 0;
@@ -322,6 +486,8 @@ void async_job_worker(ServerRuntime& runtime) {
             ok = execute_vid_gen_job(runtime,
                                      *job,
                                      output_media_b64,
+                                     output_media_path,
+                                     output_media_file_name,
                                      output_media_mime_type,
                                      output_frame_count,
                                      output_fps,
@@ -342,6 +508,8 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->status                 = AsyncJobStatus::Completed;
                 job->result_images_b64      = std::move(output_images);
                 job->result_media_b64       = std::move(output_media_b64);
+                job->result_media_path      = std::move(output_media_path);
+                job->result_media_file_name = std::move(output_media_file_name);
                 job->result_media_mime_type = std::move(output_media_mime_type);
                 job->result_frame_count     = output_frame_count;
                 job->result_fps             = output_fps;
@@ -353,6 +521,8 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->error_message = error_message.empty() ? "unknown generation error" : error_message;
                 job->result_images_b64.clear();
                 job->result_media_b64.clear();
+                job->result_media_path.clear();
+                job->result_media_file_name.clear();
                 job->result_media_mime_type.clear();
                 job->result_frame_count = 0;
                 job->result_fps         = 0;

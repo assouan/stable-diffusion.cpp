@@ -173,6 +173,16 @@ public:
     virtual sd::Tensor<float> compute(int n_threads,
                                       const DiffusionParams& diffusion_params) = 0;
 
+    virtual bool get_attention_sparsity(float* sparsity) const {
+        (void)sparsity;
+        return false;
+    }
+
+    virtual bool set_attention_sparsity(float sparsity) {
+        (void)sparsity;
+        return false;
+    }
+
     void sampling_done() {
         runner_done();
         on_sampling_done();

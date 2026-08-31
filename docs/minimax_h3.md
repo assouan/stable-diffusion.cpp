@@ -94,3 +94,88 @@ frame rate and optional soundtrack; non-24-fps inputs are resampled internally.
 - MiniMax-H3 runs at 24 fps; another requested value is overridden.
 - The default video flow shift is 12. The audio stream is mapped internally to
   its shift of 3, so the regular samplers can operate on the packed AV latent.
+
+## Long-sequence activation memory
+
+MiniMax-H3 uses token chunking and BF16 activation storage by default. This
+keeps the Q/K/V projections, the MLP, and the hidden-state cache from growing
+as full F32 temporaries for the complete packed audio/video sequence. The
+default values are equivalent to:
+
+```sh
+--model-args minimax_h3_attention_chunk_size=4096,minimax_h3_mlp_chunk_size=4096,minimax_h3_activation_storage=bf16
+```
+
+Attention chunking requires FlashAttention. Each query chunk attends to the
+complete K/V sequence, so dense attention remains mathematically dense; the
+chunk size only changes how the graph is evaluated. Runtime LoRA is supported.
+For ordinary LoRA tensors, the Q, K, and V output ranges are projected
+independently. An adapter layout that cannot be sliced safely falls back to the
+full projection instead of applying a partial adapter incorrectly.
+
+The knobs can be changed independently:
+
+- `minimax_h3_attention_chunk_size`: query and Q/K/V projection chunk size;
+  `0` disables attention chunking. A non-zero value must be a multiple of 128.
+- `minimax_h3_mlp_chunk_size`: token chunk size for the MLP; `0` disables its
+  standalone chunking.
+- `minimax_h3_activation_storage`: hidden-state storage type between blocks;
+  accepted values are `bf16`, `f16`, and `f32`.
+
+For a legacy-memory comparison with the unchunked F32 graph, use all three
+overrides together:
+
+```sh
+--model-args minimax_h3_attention_chunk_size=0,minimax_h3_mlp_chunk_size=0,minimax_h3_activation_storage=f32
+```
+
+These settings concern activations only. They do not make model layers
+resident and do not change `--resident-layers`, the streaming pool, or the
+parameter backend.
+
+## Dynamic sparse attention (CUDA)
+
+MiniMax-H3 transformer blocks can use block-routed sparse FlashAttention with
+the `minimax_h3_attention_sparsity` model argument. For example, the LightX2V
+Turbo-SLA adapter is intended for 85% sparsity:
+
+```sh
+--diffusion-fa --model-args minimax_h3_attention_sparsity=0.85
+```
+
+The native async server can override the same value for one video job, so a
+single loaded MiniMax-H3 context can alternate between dense and SLA requests:
+
+```json
+{
+  "sample_params": {
+    "sample_steps": 4,
+    "flow_shift": 6.0
+  },
+  "model_options": {
+    "minimax_h3_attention_sparsity": 0.85
+  },
+  "lora": [
+    {
+      "path": "minimax_h3_fl2v_turbo_4step_v0.1_768p_sla_comfyui_q8_0.gguf",
+      "multiplier": 1.0
+    }
+  ]
+}
+```
+
+Set the request value to `0` for dense attention. The server applies the
+override only while that job owns the generation context and restores the
+previous value afterward. C API users can perform the same operation with
+`sd_ctx_get_attention_sparsity` and `sd_ctx_set_attention_sparsity`; these
+functions must not be called concurrently with generation.
+
+Use this only with a checkpoint or adapter trained for sparse attention.
+Enabling it on an arbitrary dense checkpoint can change output quality. The
+token refiners remain dense.
+
+The sparse kernel currently requires an NVIDIA CUDA backend with tensor-core
+FlashAttention support, 128-wide attention heads, unmasked self-attention, and
+at most 65,536 key tokens. If only the sparse variant is unsupported, the
+operation is retried as dense FlashAttention. The regular manual dense path is
+used only when dense FlashAttention itself is unavailable.

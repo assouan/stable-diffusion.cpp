@@ -1,8 +1,12 @@
 #include "model_manager.h"
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
 #include <iterator>
 #include <mutex>
 #include <unordered_set>
@@ -56,6 +60,18 @@ static bool backend_supports_host_buffer(ggml_backend_t backend) {
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
     return props.caps.buffer_from_host_ptr;
+}
+
+static bool direct_storage_requested() {
+    const char* value = std::getenv("SD_DIRECT_STORAGE");
+    if (value == nullptr) {
+        return true;
+    }
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return normalized != "0" && normalized != "false" && normalized != "off";
 }
 
 static bool device_supports_param_op(ggml_backend_dev_t device,
@@ -185,7 +201,58 @@ void ModelManager::release_all_streaming_pools() {
     streaming_pool_configs_.clear();
 }
 
-void ModelManager::synchronize_prefetch_block(PrefetchBlock& block) {
+bool ModelManager::synchronize_prefetch_block(PrefetchBlock& block) {
+    bool success = true;
+    if (block.disk_load_future.valid()) {
+        try {
+            success = block.disk_load_future.get();
+        } catch (const std::exception& error) {
+            LOG_WARN("model manager direct-storage worker failed: %s", error.what());
+            success = false;
+        } catch (...) {
+            LOG_WARN("model manager direct-storage worker failed with an unknown error");
+            success = false;
+        }
+        const char* load_mode = "buffered disk";
+        if (block.disk_load_used_direct) {
+            if (block.disk_load_stats.aio_used) {
+                load_mode = block.disk_load_stats.buffered_tensor_count > 0
+                                ? "O_DIRECT AIO hybrid"
+                                : "O_DIRECT AIO";
+            } else {
+                load_mode = block.disk_load_stats.buffered_tensor_count > 0
+                                ? "O_DIRECT hybrid"
+                                : "O_DIRECT";
+            }
+        }
+        const char* read_label = block.disk_load_stats.aio_used ? "aio-wait" : "read";
+        LOG_DEBUG(
+            "model manager %s segment %" PRIu64
+            " load (%6.2f MB payload, %6.2f MB storage, %zu tensors: %zu direct, %zu buffered, "
+            "%zu x %.0f MB staging, %zu I/O requests), taking %.3fs "
+            "(setup: %.3fs, %s: %.3fs, copy-submit: %.3fs, wait: %.3fs, buffered: %.3fs)",
+            load_mode,
+            block.key.segment_id,
+            block.disk_load_stats.payload_bytes / (1024.f * 1024.f),
+            block.disk_load_stats.storage_bytes / (1024.f * 1024.f),
+            block.disk_load_stats.tensor_count,
+            block.disk_load_stats.direct_tensor_count,
+            block.disk_load_stats.buffered_tensor_count,
+            block.disk_load_stats.staging_buffer_count,
+            block.disk_load_stats.staging_buffer_count > 0
+                ? block.disk_load_stats.staging_bytes /
+                      static_cast<double>(block.disk_load_stats.staging_buffer_count) /
+                      (1024.0 * 1024.0)
+                : 0.0,
+            block.disk_load_stats.storage_request_count,
+            block.disk_load_stats.total_seconds,
+            block.disk_load_stats.setup_seconds,
+            read_label,
+            block.disk_load_stats.read_seconds,
+            block.disk_load_stats.copy_seconds,
+            block.disk_load_stats.wait_seconds,
+            block.disk_load_stats.buffered_seconds);
+    }
     if (block.event != nullptr) {
         ggml_backend_event_synchronize(block.event);
         ggml_backend_event_free(block.event);
@@ -194,6 +261,74 @@ void ModelManager::synchronize_prefetch_block(PrefetchBlock& block) {
         ggml_backend_synchronize(block.transfer_backend);
     }
     block.transfer_backend = nullptr;
+    return success;
+}
+
+bool ModelManager::load_disk_prefetch_block(PrefetchBlock& block) {
+    std::map<std::string, ggml_tensor*> targets;
+    for (const auto& pair : block.staged_tensors) {
+        TensorState* state          = pair.first;
+        ggml_tensor* staging_tensor = pair.second;
+        if (state == nullptr || staging_tensor == nullptr) {
+            return false;
+        }
+        targets[state->name] = staging_tensor;
+    }
+
+    bool direct_enabled = direct_storage_requested() && !direct_storage_failed_.load();
+    if (direct_enabled &&
+        model_loader_.load_tensors_direct(targets,
+                                          block.transfer_backend,
+                                          &block.disk_load_stats)) {
+        block.disk_load_used_direct = block.disk_load_stats.storage_bytes > 0;
+        return true;
+    }
+
+    const std::string direct_error = direct_enabled
+                                         ? block.disk_load_stats.error
+                                         : (direct_storage_failed_.load()
+                                                ? "disabled after an earlier direct-storage failure"
+                                                : "disabled by SD_DIRECT_STORAGE");
+    if (direct_enabled) {
+        direct_storage_failed_.store(true);
+    }
+    if (!direct_storage_fallback_warned_.exchange(true)) {
+        LOG_WARN("direct storage unavailable (%s); falling back to buffered model reads",
+                 direct_error.c_str());
+    }
+
+    block.disk_load_used_direct = false;
+    block.disk_load_stats       = {};
+    const auto start            = std::chrono::steady_clock::now();
+    std::set<std::string> loaded_names;
+    std::mutex loaded_names_mutex;
+    auto on_new_tensor = [&](const TensorStorage& storage, ggml_tensor** destination) {
+        *destination = nullptr;
+        auto target  = targets.find(storage.name);
+        if (target == targets.end()) {
+            return true;
+        }
+        *destination = target->second;
+        std::lock_guard<std::mutex> lock(loaded_names_mutex);
+        loaded_names.insert(storage.name);
+        return true;
+    };
+    std::set<std::string> target_names;
+    for (const auto& target : targets) {
+        target_names.insert(target.first);
+        block.disk_load_stats.payload_bytes += ggml_nbytes(target.second);
+    }
+    const bool loaded                           = model_loader_.load_tensors(on_new_tensor,
+                                                                             false,
+                                                                             &target_names,
+                                                                             false);
+    block.disk_load_stats.total_seconds         = std::chrono::duration<double>(
+                                                      std::chrono::steady_clock::now() - start)
+                                                      .count();
+    block.disk_load_stats.buffered_seconds      = block.disk_load_stats.total_seconds;
+    block.disk_load_stats.tensor_count          = loaded_names.size();
+    block.disk_load_stats.buffered_tensor_count = loaded_names.size();
+    return loaded && loaded_names.size() == targets.size();
 }
 
 void ModelManager::free_prefetch_block(PrefetchBlock& block) {
@@ -214,6 +349,17 @@ void ModelManager::free_prefetch_block(PrefetchBlock& block) {
 
 ParamPrefetchResult ModelManager::populate_prefetch_block(PrefetchBlock& block) {
     if (block.states.empty() || block.compute_backend == nullptr) {
+        return ParamPrefetchResult::FAILURE;
+    }
+
+    const bool disk_source     = std::all_of(block.states.begin(), block.states.end(), [](TensorState* state) {
+        return state != nullptr && state->residency_mode == ResidencyMode::Disk;
+    });
+    const bool any_disk_source = std::any_of(block.states.begin(), block.states.end(), [](TensorState* state) {
+        return state != nullptr && state->residency_mode == ResidencyMode::Disk;
+    });
+    if (any_disk_source && !disk_source) {
+        LOG_WARN("model manager segment prefetch cannot mix disk and memory parameter sources");
         return ParamPrefetchResult::FAILURE;
     }
 
@@ -239,8 +385,8 @@ ParamPrefetchResult ModelManager::populate_prefetch_block(PrefetchBlock& block) 
 
     block.staged_tensors.reserve(block.states.size());
     for (TensorState* state : block.states) {
-        if (state == nullptr || state->tensor == nullptr || state->tensor->buffer == nullptr ||
-            state->tensor->data == nullptr ||
+        if (state == nullptr || state->tensor == nullptr ||
+            (!disk_source && (state->tensor->buffer == nullptr || state->tensor->data == nullptr)) ||
             state->params_backend == nullptr || state->staged_to_compute_backend ||
             state->active_prepare_count > 0) {
             LOG_WARN("model manager segment prefetch source state changed before transfer");
@@ -314,6 +460,27 @@ ParamPrefetchResult ModelManager::populate_prefetch_block(PrefetchBlock& block) 
         ggml_backend_buffer_set_usage(block.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
 
+    if (disk_source) {
+        try {
+            block.disk_load_future = std::async(std::launch::async, [this, &block]() {
+                return load_disk_prefetch_block(block);
+            });
+        } catch (const std::exception& error) {
+            LOG_WARN("model manager could not start the direct-storage worker: %s", error.what());
+            return ParamPrefetchResult::FAILURE;
+        }
+        LOG_DEBUG("model manager queued segment %" PRIu64
+                  " disk prefetch (%6.2f MB, %zu tensors) to %s",
+                  block.key.segment_id,
+                  (block.pool_slot != nullptr
+                       ? block.pool_slot->capacity
+                       : ggml_backend_buffer_get_size(block.buffer)) /
+                      (1024.f * 1024.f),
+                  block.states.size(),
+                  ggml_backend_name(block.compute_backend));
+        return ParamPrefetchResult::SUCCESS;
+    }
+
     for (const auto& pair : block.staged_tensors) {
         TensorState* state          = pair.first;
         ggml_tensor* staging_tensor = pair.second;
@@ -379,8 +546,16 @@ ParamPrefetchResult ModelManager::enqueue_param_prefetch(
     }
 
     std::vector<TensorState*> required_states;
-    if (!resolve_required_tensor_states(tensors, required_states) ||
-        !load_tensors_to_params_backend(required_states)) {
+    if (!resolve_required_tensor_states(tensors, required_states)) {
+        return ParamPrefetchResult::FAILURE;
+    }
+    std::vector<TensorState*> memory_source_states;
+    for (TensorState* state : required_states) {
+        if (state != nullptr && state->residency_mode != ResidencyMode::Disk) {
+            memory_source_states.push_back(state);
+        }
+    }
+    if (!load_tensors_to_params_backend(memory_source_states)) {
         return ParamPrefetchResult::FAILURE;
     }
 
@@ -389,7 +564,9 @@ ParamPrefetchResult ModelManager::enqueue_param_prefetch(
     ggml_backend_t compute_backend = nullptr;
     for (TensorState* state : required_states) {
         if (state == nullptr || should_ignore(*state) || is_optional_missing_tensor(state->name) ||
-            state->compute_backend == state->params_backend || state->staged_to_compute_backend) {
+            (state->compute_backend == state->params_backend &&
+             state->residency_mode != ResidencyMode::Disk) ||
+            state->staged_to_compute_backend) {
             continue;
         }
         if (state->active_prepare_count > 0) {
@@ -458,7 +635,8 @@ bool ModelManager::activate_param_prefetch(uintptr_t owner_id,
                                             [&](TensorState* state) {
                                                 return state == nullptr || should_ignore(*state) ||
                                                        is_optional_missing_tensor(state->name) ||
-                                                       state->compute_backend == state->params_backend ||
+                                                       (state->compute_backend == state->params_backend &&
+                                                        state->residency_mode != ResidencyMode::Disk) ||
                                                        state->staged_to_compute_backend;
                                             });
     if (already_staged) {
@@ -478,7 +656,10 @@ bool ModelManager::activate_param_prefetch(uintptr_t owner_id,
     }
     std::unique_ptr<PrefetchBlock> block = std::move(existing->second);
     prefetch_blocks_.erase(existing);
-    synchronize_prefetch_block(*block);
+    if (!synchronize_prefetch_block(*block)) {
+        free_prefetch_block(*block);
+        return false;
+    }
 
     LOG_DEBUG("model manager activated prefetched segment %" PRIu64
               " (%6.2f MB, %zu tensors) on %s",
@@ -500,9 +681,24 @@ bool ModelManager::activate_param_prefetch(uintptr_t owner_id,
             return false;
         }
     }
-    for (auto& pair : block->staged_tensors) {
+    for (size_t tensor_index = 0; tensor_index < block->staged_tensors.size(); ++tensor_index) {
+        auto& pair                   = block->staged_tensors[tensor_index];
         TensorState* state          = pair.first;
         ggml_tensor* staging_tensor = pair.second;
+        if (!sd_backend_alias_tensor(block->compute_backend, staging_tensor, state->tensor)) {
+            LOG_ERROR("model manager failed to bind streamed tensor '%s' to the meta backend",
+                      state->name.c_str());
+            for (size_t rollback = 0; rollback < tensor_index; ++rollback) {
+                TensorState* rollback_state          = block->staged_tensors[rollback].first;
+                ggml_tensor* rollback_staging_tensor = block->staged_tensors[rollback].second;
+                std::swap(rollback_state->tensor->buffer, rollback_staging_tensor->buffer);
+                std::swap(rollback_state->tensor->data, rollback_staging_tensor->data);
+                std::swap(rollback_state->tensor->extra, rollback_staging_tensor->extra);
+                rollback_state->staged_to_compute_backend = false;
+            }
+            free_prefetch_block(*block);
+            return false;
+        }
         std::swap(state->tensor->buffer, staging_tensor->buffer);
         std::swap(state->tensor->data, staging_tensor->data);
         std::swap(state->tensor->extra, staging_tensor->extra);
@@ -554,6 +750,10 @@ StreamingPoolAllocation ModelManager::configure_streaming_pool(
     }
     slot_bytes = GGML_PAD(slot_bytes, alignment);
     slot_count = std::min(slot_count, SIZE_MAX / slot_bytes);
+    ggml_backend_dev_t compute_device = ggml_backend_get_device(compute_backend);
+    const bool independent_slot_buffers = compute_device != nullptr &&
+                                          ggml_backend_dev_type(compute_device) ==
+                                              GGML_BACKEND_DEVICE_TYPE_META;
 
     auto existing = streaming_pool_configs_.find(owner_id);
     if (existing != streaming_pool_configs_.end()) {
@@ -562,17 +762,32 @@ StreamingPoolAllocation ModelManager::configure_streaming_pool(
         if (config.slot_bytes > 0 && config.slot_count <= SIZE_MAX / config.slot_bytes) {
             configured_bytes = config.slot_count * config.slot_bytes;
         }
-        bool slots_valid = config.pool_buffer != nullptr &&
-                           config.pool_buffer->buffer != nullptr &&
-                           config.pool_buffer->capacity >= configured_bytes &&
-                           config.slot_count > 0 && config.slot_bytes > 0 &&
+        bool slots_valid = config.slot_count > 0 && config.slot_bytes > 0 &&
                            config.slots.size() == config.slot_count;
-        for (size_t index = 0; slots_valid && index < config.slots.size(); ++index) {
-            const auto& slot = config.slots[index];
-            if (slot == nullptr || slot->pool_buffer != config.pool_buffer ||
-                slot->offset != index * config.slot_bytes ||
-                slot->capacity != config.slot_bytes) {
-                slots_valid = false;
+        if (independent_slot_buffers) {
+            slots_valid = slots_valid && config.pool_buffer == nullptr;
+            std::unordered_set<ggml_backend_buffer_t> slot_buffers;
+            for (size_t index = 0; slots_valid && index < config.slots.size(); ++index) {
+                const auto& slot = config.slots[index];
+                if (slot == nullptr || slot->pool_buffer == nullptr ||
+                    slot->pool_buffer->buffer == nullptr || slot->offset != 0 ||
+                    slot->capacity != config.slot_bytes ||
+                    slot->pool_buffer->capacity < config.slot_bytes ||
+                    !slot_buffers.insert(slot->pool_buffer->buffer).second) {
+                    slots_valid = false;
+                }
+            }
+        } else {
+            slots_valid = slots_valid && config.pool_buffer != nullptr &&
+                          config.pool_buffer->buffer != nullptr &&
+                          config.pool_buffer->capacity >= configured_bytes;
+            for (size_t index = 0; slots_valid && index < config.slots.size(); ++index) {
+                const auto& slot = config.slots[index];
+                if (slot == nullptr || slot->pool_buffer != config.pool_buffer ||
+                    slot->offset != index * config.slot_bytes ||
+                    slot->capacity != config.slot_bytes) {
+                    slots_valid = false;
+                }
             }
         }
         const bool reusable = slots_valid &&
@@ -598,52 +813,85 @@ StreamingPoolAllocation ModelManager::configure_streaming_pool(
     for (size_t candidate_slot_count = requested_slot_count;
          candidate_slot_count > 0;
          --candidate_slot_count) {
-        const size_t pool_bytes = candidate_slot_count * slot_bytes;
-        auto pool_buffer        = std::make_shared<StreamingPoolBuffer>();
-        pool_buffer->buffer     = ggml_backend_buft_alloc_buffer(buffer_type, pool_bytes);
-        if (pool_buffer->buffer == nullptr) {
-            LOG_DEBUG("model manager failed to allocate a %.2f MB contiguous streaming pool",
-                      pool_bytes / (1024.f * 1024.f));
-            continue;
-        }
-        ggml_backend_buffer_set_usage(pool_buffer->buffer,
-                                      GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        pool_buffer->capacity = ggml_backend_buffer_get_size(pool_buffer->buffer);
-        if (pool_buffer->capacity < pool_bytes) {
-            LOG_ERROR("model manager streaming pool returned an invalid buffer capacity");
-            continue;
-        }
-        void* base = ggml_backend_buffer_get_base(pool_buffer->buffer);
-        if (base == nullptr || aligned_offset(base, 0, alignment) != 0) {
-            LOG_ERROR("model manager streaming pool returned an unaligned buffer base");
-            continue;
-        }
-
         StreamingPoolConfig config;
         config.compute_backend = compute_backend;
         config.buffer_type     = buffer_type;
         config.slot_count      = candidate_slot_count;
         config.slot_bytes      = slot_bytes;
-        config.pool_buffer     = std::move(pool_buffer);
         config.slots.reserve(candidate_slot_count);
-        for (size_t index = 0; index < candidate_slot_count; ++index) {
-            auto slot         = std::make_shared<StreamingPoolSlot>();
-            slot->owner_id    = owner_id;
-            slot->pool_buffer = config.pool_buffer;
-            slot->offset      = index * slot_bytes;
-            slot->capacity    = slot_bytes;
-            config.slots.push_back(std::move(slot));
+        size_t reserved_bytes = 0;
+        bool allocation_ok    = true;
+
+        if (independent_slot_buffers) {
+            for (size_t index = 0; index < candidate_slot_count; ++index) {
+                auto slot_buffer    = std::make_shared<StreamingPoolBuffer>();
+                slot_buffer->buffer = ggml_backend_buft_alloc_buffer(buffer_type, slot_bytes);
+                if (slot_buffer->buffer == nullptr) {
+                    allocation_ok = false;
+                    break;
+                }
+                ggml_backend_buffer_set_usage(slot_buffer->buffer,
+                                              GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                slot_buffer->capacity = ggml_backend_buffer_get_size(slot_buffer->buffer);
+                void* base = ggml_backend_buffer_get_base(slot_buffer->buffer);
+                if (slot_buffer->capacity < slot_bytes || base == nullptr ||
+                    aligned_offset(base, 0, alignment) != 0) {
+                    allocation_ok = false;
+                    break;
+                }
+                reserved_bytes = saturating_add(reserved_bytes, slot_buffer->capacity);
+
+                auto slot         = std::make_shared<StreamingPoolSlot>();
+                slot->owner_id    = owner_id;
+                slot->pool_buffer = std::move(slot_buffer);
+                slot->offset      = 0;
+                slot->capacity    = slot_bytes;
+                config.slots.push_back(std::move(slot));
+            }
+        } else {
+            const size_t pool_bytes = candidate_slot_count * slot_bytes;
+            auto pool_buffer        = std::make_shared<StreamingPoolBuffer>();
+            pool_buffer->buffer     = ggml_backend_buft_alloc_buffer(buffer_type, pool_bytes);
+            if (pool_buffer->buffer != nullptr) {
+                ggml_backend_buffer_set_usage(pool_buffer->buffer,
+                                              GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                pool_buffer->capacity = ggml_backend_buffer_get_size(pool_buffer->buffer);
+                void* base = ggml_backend_buffer_get_base(pool_buffer->buffer);
+                allocation_ok = pool_buffer->capacity >= pool_bytes && base != nullptr &&
+                                aligned_offset(base, 0, alignment) == 0;
+            } else {
+                allocation_ok = false;
+            }
+            if (allocation_ok) {
+                reserved_bytes     = pool_buffer->capacity;
+                config.pool_buffer = std::move(pool_buffer);
+                for (size_t index = 0; index < candidate_slot_count; ++index) {
+                    auto slot         = std::make_shared<StreamingPoolSlot>();
+                    slot->owner_id    = owner_id;
+                    slot->pool_buffer = config.pool_buffer;
+                    slot->offset      = index * slot_bytes;
+                    slot->capacity    = slot_bytes;
+                    config.slots.push_back(std::move(slot));
+                }
+            }
         }
 
-        const size_t reserved_bytes = config.pool_buffer->capacity;
+        if (!allocation_ok || config.slots.size() != candidate_slot_count) {
+            LOG_DEBUG("model manager failed to allocate a %.2f MB %s streaming pool",
+                      candidate_slot_count * slot_bytes / (1024.f * 1024.f),
+                      independent_slot_buffers ? "multi-buffer" : "contiguous");
+            continue;
+        }
+
         streaming_pool_configs_.emplace(owner_id, std::move(config));
         if (candidate_slot_count < requested_slot_count) {
             LOG_WARN(
-                "model manager reduced the contiguous streaming pool from %zu to %zu slots after allocation failure",
+                "model manager reduced the streaming pool from %zu to %zu slots after allocation failure",
                 requested_slot_count,
                 candidate_slot_count);
         }
-        LOG_INFO("model manager allocated contiguous streaming pool: slots=%zu slot=%.2f MB total=%.2f MB on %s",
+        LOG_INFO("model manager allocated %s streaming pool: slots=%zu slot=%.2f MB total=%.2f MB on %s",
+                 independent_slot_buffers ? "multi-buffer" : "contiguous",
                  candidate_slot_count,
                  slot_bytes / (1024.f * 1024.f),
                  reserved_bytes / (1024.f * 1024.f),
@@ -692,6 +940,12 @@ size_t ModelManager::streaming_allocation_bytes(
         pool->second.compute_backend == compute_backend) {
         if (pool->second.pool_buffer != nullptr) {
             add_buffer(pool->second.pool_buffer->buffer);
+        } else {
+            for (const auto& slot : pool->second.slots) {
+                if (slot != nullptr && slot->pool_buffer != nullptr) {
+                    add_buffer(slot->pool_buffer->buffer);
+                }
+            }
         }
     }
     for (const auto& block : compute_staging_blocks_) {
@@ -736,6 +990,7 @@ ModelManager::~ModelManager() {
     clear_all_param_prefetches();
     release_all();
     release_all_streaming_pools();
+    model_loader_.release_direct_storage_buffers();
     for (auto& entry : prefetch_backends_) {
         if (entry.second != nullptr) {
             ggml_backend_free(entry.second);
@@ -997,6 +1252,56 @@ bool ModelManager::validate_registered_tensors() {
     return ok;
 }
 
+void ModelManager::prepare_direct_storage() {
+    if (!direct_storage_requested() || direct_storage_failed_.load()) {
+        return;
+    }
+
+    std::set<ggml_backend_t> disk_backends;
+    for (const auto& state : tensor_states_) {
+        if (state != nullptr && state->residency_mode == ResidencyMode::Disk &&
+            state->compute_backend != nullptr && !should_ignore(*state)) {
+            disk_backends.insert(state->compute_backend);
+        }
+    }
+    if (disk_backends.empty()) {
+        return;
+    }
+    if (disk_backends.size() != 1) {
+        LOG_DEBUG("model manager skipped direct-storage staging preparation for %zu compute backends",
+                  disk_backends.size());
+        return;
+    }
+
+    ggml_backend_t compute_backend  = *disk_backends.begin();
+    ggml_backend_t transfer_backend = prefetch_backend_for(compute_backend);
+    DirectStorageLoadStats stats;
+    if (transfer_backend == nullptr ||
+        !model_loader_.prepare_direct_storage_buffers(transfer_backend, &stats)) {
+        direct_storage_failed_.store(true);
+        if (!direct_storage_fallback_warned_.exchange(true)) {
+            const std::string error = transfer_backend == nullptr
+                                          ? "no transfer backend"
+                                          : stats.error;
+            LOG_WARN("direct storage unavailable during staging preparation (%s); "
+                     "falling back to buffered model reads",
+                     error.c_str());
+        }
+        return;
+    }
+
+    LOG_INFO("model manager prepared direct-storage staging (%zu x %.0f MB pinned, %s) on %s, "
+             "taking %.3fs",
+             stats.staging_buffer_count,
+             stats.staging_buffer_count > 0
+                 ? stats.staging_bytes / static_cast<double>(stats.staging_buffer_count) /
+                       (1024.0 * 1024.0)
+                  : 0.0,
+             stats.aio_used ? "Linux AIO" : "synchronous pread",
+             ggml_backend_name(compute_backend),
+             stats.total_seconds);
+}
+
 bool ModelManager::load_tensors_to_params_backend(const std::vector<TensorState*>& states) {
     std::vector<TensorState*> need_load;
     need_load.reserve(states.size());
@@ -1010,7 +1315,7 @@ bool ModelManager::load_tensors_to_params_backend(const std::vector<TensorState*
             }
             state->metadata_validated = true;
         }
-        if (!state->loaded_to_params_backend) {
+        if (!state->loaded_to_params_backend && !state->staged_to_compute_backend) {
             need_load.push_back(state);
         }
     }
@@ -1213,11 +1518,11 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
 
             std::string id = lora_id(lora_spec);
             auto lora      = std::make_shared<LoraModel>(id,
-                                                    compute_backend,
-                                                    compute_backend,
-                                                    lora_spec.path,
-                                                    lora_spec.is_high_noise ? "model.high_noise_" : "",
-                                                    lora_version_);
+                                                         compute_backend,
+                                                         compute_backend,
+                                                         lora_spec.path,
+                                                         lora_spec.is_high_noise ? "model.high_noise_" : "",
+                                                         lora_version_);
 
             LoraModel::filter_t lora_tensor_filter = nullptr;
             if (!lora_spec.tensor_name_prefix_filter.empty()) {
@@ -1759,8 +2064,8 @@ bool ModelManager::assign_compute_backend(const std::vector<ggml_tensor*>& tenso
 
         const bool params_follow_compute = state->params_follow_compute_backend ||
                                            state->residency_mode == ResidencyMode::Disk;
-        const bool compute_changes = state->compute_backend != compute_backend;
-        const bool params_changes  = params_follow_compute && state->params_backend != compute_backend;
+        const bool compute_changes       = state->compute_backend != compute_backend;
+        const bool params_changes        = params_follow_compute && state->params_backend != compute_backend;
         if (!compute_changes && !params_changes) {
             continue;
         }

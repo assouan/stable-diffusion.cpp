@@ -2,13 +2,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
 
 #include "core/util.h"
+#include "ggml/src/ggml-backend-impl.h"
 #include "ggml/src/ggml-impl.h"
 #include "stable-diffusion.h"
 
@@ -29,6 +32,11 @@ static std::string lower_copy(std::string value) {
         return static_cast<char>(std::tolower(c));
     });
     return value;
+}
+
+static bool ends_with_copy(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 static std::vector<std::string> split_copy(const std::string& value, char delimiter) {
@@ -663,12 +671,256 @@ void SDBackendHandleDeleter::operator()(ggml_backend_t backend) const {
     ggml_backend_free(backend);
 }
 
+bool sd_backend_alias_tensor(ggml_backend_t backend,
+                             const ggml_tensor* source,
+                             ggml_tensor* alias) {
+    if (!ggml_backend_is_meta(backend)) {
+        return true;
+    }
+    return ggml_backend_meta_buffer_alias_tensor(source, alias) == GGML_STATUS_SUCCESS;
+}
+
+struct SDMetaBackendState {
+    SDTensorParallelPolicy policy = SDTensorParallelPolicy::NONE;
+    SDSplitMode mode               = SDSplitMode::LAYER;
+    std::vector<ggml_backend_dev_t> devices;
+    std::vector<float> split_weights;
+    std::vector<float> sequence_split_weights;
+    SDBackendHandle backend;
+};
+
+static ggml_backend_meta_split_state mirrored_meta_split() {
+    ggml_backend_meta_split_state result{};
+    result.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    result.nr[0]      = 1;
+    result.n_segments = 1;
+    return result;
+}
+
+static ggml_backend_meta_split_state repeated_meta_split(
+    const ggml_tensor* tensor,
+    const SDMetaBackendState& state,
+    ggml_backend_meta_split_axis axis,
+    uint32_t repetitions,
+    const std::vector<float>* split_weights = nullptr,
+    int64_t minimum_granularity             = 256) {
+    if (tensor == nullptr || state.devices.empty() ||
+        state.devices.size() > GGML_BACKEND_META_MAX_DEVICES ||
+        repetitions == 0 || tensor->ne[axis] % repetitions != 0) {
+        return mirrored_meta_split();
+    }
+
+    const int64_t extent = tensor->ne[axis] / repetitions;
+    const int64_t block  = std::max<int64_t>(1, ggml_blck_size(tensor->type));
+    const int64_t granularity = std::lcm<int64_t>(minimum_granularity,
+                                                  axis == GGML_BACKEND_SPLIT_AXIS_0 ? block : 1);
+    if (extent < granularity * static_cast<int64_t>(state.devices.size()) ||
+        extent % block != 0) {
+        return mirrored_meta_split();
+    }
+
+    const std::vector<float>& weights = split_weights == nullptr ? state.split_weights
+                                                                 : *split_weights;
+    double total_weight = 0.0;
+    for (float weight : weights) {
+        if (!std::isfinite(weight) || weight <= 0.0f) {
+            return mirrored_meta_split();
+        }
+        total_weight += weight;
+    }
+    if (!(total_weight > 0.0) || weights.size() != state.devices.size()) {
+        return mirrored_meta_split();
+    }
+
+    ggml_backend_meta_split_state result{};
+    result.axis       = axis;
+    result.nr[0]      = repetitions;
+    result.n_segments = 1;
+
+    int64_t assigned = 0;
+    double cumulative_weight = 0.0;
+    for (size_t device_index = 0; device_index < state.devices.size(); ++device_index) {
+        int64_t boundary = extent;
+        if (device_index + 1 < state.devices.size()) {
+            cumulative_weight += weights[device_index];
+            const double exact = extent * cumulative_weight / total_weight;
+            boundary = static_cast<int64_t>(std::llround(exact / granularity)) * granularity;
+
+            const int64_t devices_left = static_cast<int64_t>(state.devices.size() - device_index - 1);
+            const int64_t min_boundary = assigned + granularity;
+            const int64_t max_boundary = extent - devices_left * granularity;
+            boundary = std::clamp(boundary, min_boundary, max_boundary);
+        }
+        result.ne[device_index] = boundary - assigned;
+        assigned                = boundary;
+    }
+    if (assigned != extent) {
+        return mirrored_meta_split();
+    }
+    return result;
+}
+
+static ggml_backend_meta_split_state minimax_h3_meta_split_state(
+    const ggml_tensor* tensor,
+    void* user_data) {
+    const auto* state = static_cast<const SDMetaBackendState*>(user_data);
+    if (tensor == nullptr || state == nullptr) {
+        return mirrored_meta_split();
+    }
+
+    ggml_backend_meta_split_axis collective_axis = GGML_BACKEND_SPLIT_AXIS_UNKNOWN;
+    const ggml_backend_meta_collective_type collective =
+        ggml_backend_meta_get_collective(tensor, &collective_axis);
+    if (collective == GGML_BACKEND_META_COLLECTIVE_SCATTER ||
+        collective == GGML_BACKEND_META_COLLECTIVE_ALL_TO_ALL) {
+        const auto* weights = state->mode == SDSplitMode::SEQUENCE
+                                  ? &state->sequence_split_weights
+                                  : &state->split_weights;
+        return repeated_meta_split(tensor,
+                                   *state,
+                                   collective_axis,
+                                   1,
+                                   weights,
+                                   state->mode == SDSplitMode::SEQUENCE ? 1 : 256);
+    }
+    const std::string name = ggml_get_name(tensor);
+    if (state->mode == SDSplitMode::SEQUENCE) {
+        const bool transformer_block =
+            name.find("model.diffusion_model.blocks.") != std::string::npos &&
+            name.find(".token_refiner.") == std::string::npos;
+        if (ggml_n_dims(tensor) == 2 && transformer_block &&
+            ends_with_copy(name, ".attn.qkv_proj.weight")) {
+            return repeated_meta_split(tensor, *state, GGML_BACKEND_SPLIT_AXIS_1, 3);
+        }
+        // Graph-cut cache tensors no longer retain the scatter marker that produced
+        // them. Preserve the sequence layout when those tensors are reallocated.
+        const bool h3_input_cut = name.rfind("ggml_runner_cut:minimax_h3.input_pack|", 0) == 0;
+        const bool h3_block_cut = name.rfind("ggml_runner_cut:minimax_h3.blocks.", 0) == 0;
+        const bool h3_sequence_cut = h3_input_cut || h3_block_cut;
+        const bool h3_qkv_wire_cut = h3_block_cut &&
+                                     name.find(".attention.qkv|") != std::string::npos &&
+                                     name.find("|qkv|") != std::string::npos;
+        if (h3_qkv_wire_cut) {
+            return repeated_meta_split(tensor,
+                                       *state,
+                                       GGML_BACKEND_SPLIT_AXIS_0,
+                                       3,
+                                       &state->split_weights,
+                                       256);
+        }
+        const bool h3_qkv_cut = h3_block_cut &&
+                                name.find(".attention.qkv|") != std::string::npos &&
+                                (name.find("|query|") != std::string::npos ||
+                                 name.find("|key|") != std::string::npos ||
+                                 name.find("|value|") != std::string::npos);
+        if (h3_qkv_cut) {
+            return repeated_meta_split(tensor,
+                                       *state,
+                                       GGML_BACKEND_SPLIT_AXIS_2,
+                                       1,
+                                       &state->split_weights,
+                                       1);
+        }
+        const bool h3_local_activation =
+            name.find("h3.sequence.block.") != std::string::npos ||
+            name.find("h3.sequence.modulation.") != std::string::npos ||
+            name.find("h3.sequence.attn.q") != std::string::npos;
+        if (name == "h3.block.input" || name == "h3.sequence.block.output" ||
+            h3_local_activation ||
+            (h3_sequence_cut &&
+             (name.find("|hidden_states|") != std::string::npos ||
+              name.find("|residual_input|") != std::string::npos))) {
+            return repeated_meta_split(tensor,
+                                       *state,
+                                       GGML_BACKEND_SPLIT_AXIS_1,
+                                       1,
+                                       &state->sequence_split_weights,
+                                       1);
+        }
+        if (name == "h3.sequence.modulation_indices" ||
+            (h3_input_cut && name.find("|modulation_indices|") != std::string::npos)) {
+            return repeated_meta_split(tensor,
+                                       *state,
+                                       GGML_BACKEND_SPLIT_AXIS_0,
+                                       1,
+                                       &state->sequence_split_weights,
+                                       1);
+        }
+        return mirrored_meta_split();
+    }
+    if (ggml_n_dims(tensor) != 2) {
+        return mirrored_meta_split();
+    }
+
+    const bool transformer_block =
+        name.find("model.diffusion_model.blocks.") != std::string::npos &&
+        name.find(".token_refiner.") == std::string::npos;
+    if (!transformer_block) {
+        return mirrored_meta_split();
+    }
+    if (ends_with_copy(name, ".attn.qkv_proj.weight")) {
+        return repeated_meta_split(tensor, *state, GGML_BACKEND_SPLIT_AXIS_1, 3);
+    }
+    if (ends_with_copy(name, ".attn.out_proj.weight")) {
+        return repeated_meta_split(tensor, *state, GGML_BACKEND_SPLIT_AXIS_0, 1);
+    }
+    if (ends_with_copy(name, ".mlp.fc1.weight")) {
+        return repeated_meta_split(tensor, *state, GGML_BACKEND_SPLIT_AXIS_1, 2);
+    }
+    if (ends_with_copy(name, ".mlp.fc2.weight")) {
+        return repeated_meta_split(tensor, *state, GGML_BACKEND_SPLIT_AXIS_0, 1);
+    }
+    return mirrored_meta_split();
+}
+
+static std::vector<float> parallel_weights(const char* environment_name,
+                                           size_t device_count,
+                                           const std::vector<float>& fallback) {
+    std::vector<float> weights = fallback;
+    const char* value = std::getenv(environment_name);
+    if (value == nullptr || value[0] == '\0') {
+        return weights;
+    }
+
+    const std::vector<std::string> parts = split_copy(value, ',');
+    if (parts.size() != device_count) {
+        LOG_WARN("%s has %zu entries but the tensor split uses %zu devices; using fallback weights",
+                 environment_name,
+                 parts.size(),
+                 device_count);
+        return weights;
+    }
+
+    std::vector<float> parsed;
+    parsed.reserve(parts.size());
+    for (const std::string& raw : parts) {
+        const std::string part = trim_copy(raw);
+        char* end              = nullptr;
+        float weight           = std::strtof(part.c_str(), &end);
+        if (end == part.c_str() || *end != '\0' || !std::isfinite(weight) || weight <= 0.0f) {
+            LOG_WARN("invalid %s value '%s'; using fallback weights", environment_name, value);
+            return weights;
+        }
+        parsed.push_back(weight);
+    }
+    return parsed;
+}
+
+static std::vector<float> tensor_parallel_weights(size_t device_count) {
+    return parallel_weights("SD_TENSOR_SPLIT",
+                            device_count,
+                            std::vector<float>(device_count, 1.0f));
+}
+
+SDBackendManager::SDBackendManager() = default;
 SDBackendManager::~SDBackendManager() {
     reset();
 }
 
 void SDBackendManager::reset() {
+    meta_backends_.clear();
     backends_.clear();
+    tensor_parallel_policies_.clear();
     runtime_assignment_    = {};
     params_assignment_     = {};
     split_mode_assignment_ = {};
@@ -691,10 +943,18 @@ static std::string primary_device_name(const std::string& value) {
 }
 
 ggml_backend_t SDBackendManager::runtime_backend(SDBackendModule module) {
+    if (tensor_parallel_active(module)) {
+        return init_meta_backend(module);
+    }
     return init_cached_backend(primary_device_name(runtime_assignment_.get(module)));
 }
 
 std::vector<ggml_backend_t> SDBackendManager::runtime_backends(SDBackendModule module) {
+    if (tensor_parallel_active(module)) {
+        ggml_backend_t backend = runtime_backend(module);
+        return backend != nullptr ? std::vector<ggml_backend_t>{backend}
+                                  : std::vector<ggml_backend_t>{};
+    }
     std::vector<ggml_backend_t> backends;
     for (const std::string& name : split_device_list(runtime_assignment_.get(module))) {
         ggml_backend_t backend = init_cached_backend(name);
@@ -781,8 +1041,129 @@ bool SDBackendManager::init(const char* backend_spec,
 }
 
 SDSplitMode SDBackendManager::split_mode(SDBackendModule module) const {
-    return lower_copy(trim_copy(split_mode_assignment_.get(module))) == "row" ? SDSplitMode::ROW
-                                                                              : SDSplitMode::LAYER;
+    const std::string mode = lower_copy(trim_copy(split_mode_assignment_.get(module)));
+    if (mode == "row") {
+        return SDSplitMode::ROW;
+    }
+    if (mode == "sequence") {
+        return SDSplitMode::SEQUENCE;
+    }
+    return SDSplitMode::LAYER;
+}
+
+void SDBackendManager::set_tensor_parallel_policy(SDBackendModule module,
+                                                  SDTensorParallelPolicy policy) {
+    auto current = tensor_parallel_policies_.find(module);
+    if (current != tensor_parallel_policies_.end() && current->second == policy) {
+        return;
+    }
+    meta_backends_.erase(module);
+    if (policy == SDTensorParallelPolicy::NONE) {
+        tensor_parallel_policies_.erase(module);
+    } else {
+        tensor_parallel_policies_[module] = policy;
+    }
+}
+
+bool SDBackendManager::tensor_parallel_active(SDBackendModule module) const {
+    auto policy = tensor_parallel_policies_.find(module);
+    return policy != tensor_parallel_policies_.end() &&
+           policy->second != SDTensorParallelPolicy::NONE &&
+           split_mode(module) != SDSplitMode::LAYER &&
+           split_device_list(runtime_assignment_.get(module)).size() > 1;
+}
+
+ggml_backend_t SDBackendManager::init_meta_backend(SDBackendModule module) {
+    auto existing = meta_backends_.find(module);
+    if (existing != meta_backends_.end()) {
+        return existing->second->backend.get();
+    }
+
+    auto policy = tensor_parallel_policies_.find(module);
+    if (policy == tensor_parallel_policies_.end() ||
+        policy->second != SDTensorParallelPolicy::MINIMAX_H3) {
+        return nullptr;
+    }
+
+    const std::vector<std::string> names = split_device_list(runtime_assignment_.get(module));
+    if (names.size() < 2 || names.size() > GGML_BACKEND_META_MAX_DEVICES) {
+        LOG_ERROR("%s tensor parallel backend requires between 2 and %d devices",
+                  sd_backend_module_name(module),
+                  GGML_BACKEND_META_MAX_DEVICES);
+        return nullptr;
+    }
+
+    auto state    = std::make_unique<SDMetaBackendState>();
+    state->policy = policy->second;
+    state->mode   = split_mode(module);
+    state->devices.reserve(names.size());
+    for (const std::string& name : names) {
+        const std::string resolved = sd_backend_resolve_name(name);
+        ggml_backend_dev_t dev     = resolve_device_by_name(resolved);
+        if (dev == nullptr) {
+            LOG_ERROR("failed to resolve tensor parallel device '%s'", name.c_str());
+            return nullptr;
+        }
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            LOG_ERROR("MiniMax-H3 tensor parallelism currently requires CUDA GPU devices; '%s' is not a GPU",
+                      ggml_backend_dev_name(dev));
+            return nullptr;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr || lower_copy(ggml_backend_reg_name(reg)) != "cuda") {
+            LOG_ERROR("MiniMax-H3 tensor parallelism currently requires CUDA devices; '%s' is unsupported",
+                      ggml_backend_dev_name(dev));
+            return nullptr;
+        }
+        if (std::find(state->devices.begin(), state->devices.end(), dev) != state->devices.end()) {
+            LOG_ERROR("MiniMax-H3 tensor parallel device '%s' was selected more than once",
+                      ggml_backend_dev_name(dev));
+            return nullptr;
+        }
+        state->devices.push_back(dev);
+    }
+    state->split_weights = tensor_parallel_weights(state->devices.size());
+    state->sequence_split_weights = parallel_weights("SD_SEQUENCE_SPLIT",
+                                                     state->devices.size(),
+                                                     state->split_weights);
+
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(state->devices.data(),
+                                                           state->devices.size(),
+                                                           minimax_h3_meta_split_state,
+                                                           state.get());
+    if (meta_dev == nullptr) {
+        LOG_ERROR("failed to create the MiniMax-H3 tensor parallel meta device");
+        return nullptr;
+    }
+    state->backend.reset(ggml_backend_dev_init(meta_dev, nullptr));
+    if (state->backend == nullptr) {
+        LOG_ERROR("failed to initialize the MiniMax-H3 tensor parallel meta backend");
+        return nullptr;
+    }
+
+    std::ostringstream devices;
+    std::ostringstream sequence_devices;
+    for (size_t i = 0; i < state->devices.size(); ++i) {
+        if (i > 0) {
+            devices << ", ";
+            sequence_devices << ", ";
+        }
+        devices << ggml_backend_dev_name(state->devices[i]) << "=" << state->split_weights[i];
+        sequence_devices << ggml_backend_dev_name(state->devices[i]) << "="
+                         << state->sequence_split_weights[i];
+    }
+    if (state->mode == SDSplitMode::SEQUENCE) {
+        LOG_INFO("MiniMax-H3 Ulysses sequence split enabled: heads={%s}, tokens={%s} (SSD-streamed weights)",
+                 devices.str().c_str(),
+                 sequence_devices.str().c_str());
+    } else {
+        LOG_INFO("MiniMax-H3 tensor parallel row split enabled: %s (AllReduce output mirrored on every GPU)",
+                 devices.str().c_str());
+    }
+
+    ggml_backend_t result = state->backend.get();
+    meta_backends_.emplace(module, std::move(state));
+    return result;
 }
 
 ggml_backend_buffer_type_t SDBackendManager::split_buffer_type(ggml_backend_t backend,
@@ -875,11 +1256,11 @@ bool SDBackendManager::validate(std::string* error) const {
     };
     auto validate_split_mode_name = [&](const std::string& name) -> bool {
         const std::string lower = lower_copy(trim_copy(name));
-        if (lower.empty() || lower == "layer" || lower == "row") {
+        if (lower.empty() || lower == "layer" || lower == "row" || lower == "sequence") {
             return true;
         }
         if (error != nullptr) {
-            *error = "invalid split mode '" + name + "' (expected layer or row)";
+            *error = "invalid split mode '" + name + "' (expected layer, row, or sequence)";
         }
         return false;
     };

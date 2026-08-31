@@ -28,6 +28,23 @@ If you want to use a different host or port, pass:
 --listen-ip <ip> --listen-port <port>
 ```
 
+To persist completed video jobs instead of embedding the encoded container in
+the polling JSON, mount a writable directory and pass it to the server:
+
+```bash
+sd-server ... --output-dir /data/videos
+```
+
+The completed job result contains the persisted filename and an optional
+`/sdcpp/v1/jobs/{id}/result` download URL. The file itself remains under
+`/data/videos`.
+
+For MiniMax-H3, the native `POST /sdcpp/v1/vid_gen` endpoint also accepts a
+per-job `model_options.minimax_h3_attention_sparsity` value. This lets one
+server switch between dense (`0`) and compatible SLA sparse profiles (for
+example `0.85`) while selecting steps, flow shift, and LoRA in the same HTTP
+request. The base diffusion model remains a server startup option.
+
 # Frontend
 
 ## Build with Frontend

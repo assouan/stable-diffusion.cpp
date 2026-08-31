@@ -192,6 +192,7 @@ ArgOptions SDSvrParams::get_options() {
     options.string_options = {
         {"-l", "--listen-ip", "server listen ip (default: 127.0.0.1)", 0, &listen_ip},
         {"", "--serve-html-path", "path to HTML file to serve at root (optional)", 0, &serve_html_path},
+        {"", "--output-dir", "persist completed video jobs in this directory (optional)", 0, &output_dir},
     };
 
     options.int_options = {
@@ -237,6 +238,25 @@ bool SDSvrParams::resolve_and_validate() {
     if (!validate()) {
         return false;
     }
+
+    if (!output_dir.empty()) {
+        std::error_code ec;
+        fs::path resolved = fs::absolute(output_dir, ec).lexically_normal();
+        if (ec) {
+            LOG_ERROR("error: unable to resolve output_dir '%s': %s",
+                      output_dir.c_str(),
+                      ec.message().c_str());
+            return false;
+        }
+        fs::create_directories(resolved, ec);
+        if (ec || !fs::is_directory(resolved)) {
+            LOG_ERROR("error: unable to create output_dir '%s': %s",
+                      resolved.u8string().c_str(),
+                      ec ? ec.message().c_str() : "path is not a directory");
+            return false;
+        }
+        output_dir = resolved.u8string();
+    }
     return true;
 }
 
@@ -246,6 +266,7 @@ std::string SDSvrParams::to_string() const {
         << "  listen_ip: " << listen_ip << ",\n"
         << "  listen_port: \"" << listen_port << "\",\n"
         << "  serve_html_path: \"" << serve_html_path << "\",\n"
+        << "  output_dir: \"" << output_dir << "\",\n"
         << "}";
     return oss.str();
 }
