@@ -43,6 +43,7 @@ enum class SDSplitMode {
     LAYER,
     ROW,
     SEQUENCE,
+    BLOCK_STREAM,
 };
 
 enum class SDTensorParallelPolicy {

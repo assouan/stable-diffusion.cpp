@@ -1048,6 +1048,9 @@ SDSplitMode SDBackendManager::split_mode(SDBackendModule module) const {
     if (mode == "sequence") {
         return SDSplitMode::SEQUENCE;
     }
+    if (mode == "block-stream" || mode == "block_stream") {
+        return SDSplitMode::BLOCK_STREAM;
+    }
     return SDSplitMode::LAYER;
 }
 
@@ -1067,9 +1070,10 @@ void SDBackendManager::set_tensor_parallel_policy(SDBackendModule module,
 
 bool SDBackendManager::tensor_parallel_active(SDBackendModule module) const {
     auto policy = tensor_parallel_policies_.find(module);
+    const SDSplitMode mode = split_mode(module);
     return policy != tensor_parallel_policies_.end() &&
            policy->second != SDTensorParallelPolicy::NONE &&
-           split_mode(module) != SDSplitMode::LAYER &&
+           (mode == SDSplitMode::ROW || mode == SDSplitMode::SEQUENCE) &&
            split_device_list(runtime_assignment_.get(module)).size() > 1;
 }
 
@@ -1256,11 +1260,13 @@ bool SDBackendManager::validate(std::string* error) const {
     };
     auto validate_split_mode_name = [&](const std::string& name) -> bool {
         const std::string lower = lower_copy(trim_copy(name));
-        if (lower.empty() || lower == "layer" || lower == "row" || lower == "sequence") {
+        if (lower.empty() || lower == "layer" || lower == "row" || lower == "sequence" ||
+            lower == "block-stream" || lower == "block_stream") {
             return true;
         }
         if (error != nullptr) {
-            *error = "invalid split mode '" + name + "' (expected layer, row, or sequence)";
+            *error = "invalid split mode '" + name +
+                     "' (expected layer, row, sequence, or block-stream)";
         }
         return false;
     };

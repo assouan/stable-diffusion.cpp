@@ -352,6 +352,42 @@ public:
         if (module_backends.size() > 1) {
             if constexpr (has_set_runtime_backends<T>::value) {
                 if (module == SDBackendModule::DIFFUSION || module == SDBackendModule::TE) {
+                    if (backend_manager.split_mode(module) == SDSplitMode::BLOCK_STREAM) {
+                        auto h3 = std::dynamic_pointer_cast<MiniMaxH3::MiniMaxH3Runner>(model);
+                        if (module != SDBackendModule::DIFFUSION || h3 == nullptr ||
+                            !h3->set_block_stream_backends(module_backends)) {
+                            LOG_ERROR("%s: block-stream is supported only by MiniMax-H3 diffusion",
+                                      desc.c_str());
+                            return false;
+                        }
+
+                        std::map<std::string, ggml_tensor*> owner_tensors[2];
+                        for (const auto& entry : group_tensors) {
+                            owner_tensors[h3->block_stream_param_owner(entry.first)].insert(entry);
+                        }
+                        const bool params_follow_runtime =
+                            backend_manager.params_backend_follows_runtime(module) ||
+                            backend_manager.params_backend_is_disk(module);
+                        for (int owner = 0; owner < 2; ++owner) {
+                            ggml_backend_t params_backend = params_follow_runtime
+                                                                ? module_backends[owner]
+                                                                : params_backend_for(module);
+                            if (!model_manager->register_param_tensors(desc,
+                                                                       std::move(owner_tensors[owner]),
+                                                                       residency_mode,
+                                                                       module_backends[owner],
+                                                                       params_backend,
+                                                                       params_mem_size,
+                                                                       false,
+                                                                       params_follow_runtime,
+                                                                       &tensor_ops)) {
+                                return false;
+                            }
+                        }
+                        LOG_INFO("%s Block Stream: weights assigned to two owner GPUs before loading",
+                                 desc.c_str());
+                        return true;
+                    }
                     if (backend_manager.split_mode(module) == SDSplitMode::ROW) {
                         return register_row_split_runner_params(desc,
                                                                 model,
@@ -994,7 +1030,8 @@ public:
             stream_layers = false;
         }
         if (stream_layers &&
-            backend_manager.runtime_backends(SDBackendModule::DIFFUSION).size() > 1) {
+            backend_manager.runtime_backends(SDBackendModule::DIFFUSION).size() > 1 &&
+            backend_manager.split_mode(SDBackendModule::DIFFUSION) != SDSplitMode::BLOCK_STREAM) {
             LOG_WARN("--stream-layers is not supported when the diffusion model uses multiple runtime backends; ignoring");
             stream_layers = false;
         }
@@ -1226,9 +1263,11 @@ public:
                                                                                  tensor_storage_map,
                                                                                  "model.diffusion_model",
                                                                                  model_manager,
-                                                                                 sd_ctx_params->model_args,
-                                                                                 backend_manager.split_mode(SDBackendModule::DIFFUSION) ==
-                                                                                    SDSplitMode::SEQUENCE);
+                                                                                  sd_ctx_params->model_args,
+                                                                                  backend_manager.split_mode(SDBackendModule::DIFFUSION) ==
+                                                                                      SDSplitMode::SEQUENCE,
+                                                                                  backend_manager.split_mode(SDBackendModule::DIFFUSION) ==
+                                                                                      SDSplitMode::BLOCK_STREAM);
             } else if (sd_version_is_hunyuan_video(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
@@ -1439,10 +1478,12 @@ public:
                                         &unet_params_mem_size)) {
                 return false;
             }
-            diffusion_model->set_stream_segment_limits(resident_layers, layer_prefetch_depth);
-            diffusion_model->set_stream_vram_safety_margin_bytes(stream_vram_safety_margin_bytes);
-            diffusion_model->set_stream_layer_pool_enabled(stream_layer_pool);
-            diffusion_model->set_stream_layers_enabled(stream_layers);
+            if (backend_manager.split_mode(SDBackendModule::DIFFUSION) != SDSplitMode::BLOCK_STREAM) {
+                diffusion_model->set_stream_segment_limits(resident_layers, layer_prefetch_depth);
+                diffusion_model->set_stream_vram_safety_margin_bytes(stream_vram_safety_margin_bytes);
+                diffusion_model->set_stream_layer_pool_enabled(stream_layer_pool);
+                diffusion_model->set_stream_layers_enabled(stream_layers);
+            }
 
             if (high_noise_diffusion_model) {
                 high_noise_diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::DIFFUSION));
@@ -1782,7 +1823,20 @@ public:
             backend_manager.params_backend_is_disk(SDBackendModule::DIFFUSION)) {
             model_manager->prepare_direct_storage();
         }
+        if (backend_manager.split_mode(SDBackendModule::DIFFUSION) == SDSplitMode::BLOCK_STREAM) {
+            auto h3 = std::dynamic_pointer_cast<MiniMaxH3::MiniMaxH3Runner>(diffusion_model);
+            if (h3 == nullptr || !h3->prepare_block_stream_weights()) {
+                LOG_ERROR("MiniMax-H3 Block Stream failed to prepare owner-resident weights");
+                return false;
+            }
+        }
 
+        if (eager_load &&
+            backend_manager.split_mode(SDBackendModule::DIFFUSION) ==
+                SDSplitMode::BLOCK_STREAM) {
+            LOG_ERROR("MiniMax-H3 Block Stream does not support --eager-load; owner-resident blocks are prepared explicitly");
+            return false;
+        }
         if (eager_load) {
             if (!model_manager->load_all_params_eagerly()) {
                 LOG_ERROR("model params eager load failed");
