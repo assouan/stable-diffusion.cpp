@@ -231,6 +231,7 @@ typedef struct {
     enum sd_vae_format_t vae_format;
     const char* max_vram;  // GiB budget or backend assignment spec for graph-cut segmented param offload (0 = disabled, -1 = auto)
     bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram)
+    bool disable_prefetch;  // Disable asynchronous layer prefetch while retaining synchronous stream_layers behavior
     bool eager_load;  // Load all params into the params backend at model-load time instead of lazily on first use
     const char* backend;
     const char* params_backend;
@@ -239,12 +240,6 @@ typedef struct {
     const char* rpc_servers;
     const char* model_args;
 } sd_ctx_params_t;
-
-typedef struct {
-    uint32_t struct_size;      // Set by sd_layer_stream_params_init; permits future extension
-    int resident_layers;       // With stream_layers: maximum leading graph-cut segments kept resident (-1 = automatic, 0 = none)
-    int layer_prefetch_depth;  // With stream_layers: future parameter-bearing graph-cut segments prefetched during compute (0 = disabled)
-} sd_layer_stream_params_t;
 
 typedef struct {
     uint32_t sample_rate;
@@ -489,11 +484,8 @@ SD_API void sd_hires_params_init(sd_hires_params_t* hires_params);
 
 SD_API void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params);
 SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
-SD_API void sd_layer_stream_params_init(sd_layer_stream_params_t* params);
 
 SD_API sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
-SD_API sd_ctx_t* new_sd_ctx_with_layer_stream(const sd_ctx_params_t* sd_ctx_params,
-                                              const sd_layer_stream_params_t* layer_stream_params);
 SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
 SD_API void free_sd_audio(sd_audio_t* audio);
 

@@ -908,8 +908,7 @@ int main(int argc, const char* argv[]) {
         }
     }
 
-    sd_ctx_params_t sd_ctx_params                = ctx_params.to_sd_ctx_params_t(cli_params.taesd_preview);
-    sd_layer_stream_params_t layer_stream_params = ctx_params.to_sd_layer_stream_params_t();
+    sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(cli_params.taesd_preview);
 
     SDImageVec results;
     int num_results             = 0;
@@ -919,7 +918,7 @@ int main(int argc, const char* argv[]) {
         num_results = 1;
         results.push_back(gen_params.init_image.release());
     } else {
-        SDCtxPtr sd_ctx(new_sd_ctx_with_layer_stream(&sd_ctx_params, &layer_stream_params));
+        SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
 
         if (sd_ctx == nullptr) {
             LOG_INFO("new_sd_ctx_t failed");
